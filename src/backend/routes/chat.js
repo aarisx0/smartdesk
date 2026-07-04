@@ -39,6 +39,22 @@ router.post('/scan', async (req, res) => {
   }
 });
 
+// Fresh folder structure endpoint — always reads from disk, never from cache or
+// IBM thread memory. Use this after organizing a folder to get the updated layout.
+router.post('/structure', async (req, res) => {
+  const { folder } = req.body;
+  if (!folder || typeof folder !== 'string') {
+    return res.status(400).json({ error: 'folder is required' });
+  }
+  try {
+    const result = await orchestrateChat.getFolderStructure(folder.trim());
+    return res.json(result);
+  } catch (err) {
+    console.error('[chat structure]', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 router.post('/execute', async (req, res) => {
   const { planId } = req.body;
   if (!planId || typeof planId !== 'string') {

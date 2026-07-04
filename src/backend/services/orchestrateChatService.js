@@ -13,6 +13,10 @@ const ORCHESTRATE_AGENT_ID = (process.env.WATSONX_AGENT_ID || '29847e54-fe41-4af
 
 let threadId = null;
 
+// Track the last time each folder was organized so we can force-refresh context
+// after an organize/move operation completes.
+const lastOrganizedAt = new Map(); // folderPath -> Date.now()
+
 const planStore = new Map();
 const VALID_INTENTS = new Set();
 
@@ -101,24 +105,59 @@ async function getIamToken() {
 // ─── File system context builders ────────────────────────────────────────────
 
 /**
- * Scan a folder and return a summary of files (name, size, extension).
- * Caps at 200 files to keep the prompt reasonable.
+ * Scan a folder and return a summary of ALL contents (files and immediate
+ * subdirectories) so structure queries always reflect the current disk state.
+ *
+ * We intentionally never cache this — every call reads the actual filesystem
+ * so "show me the structure after organising" always returns fresh data.
+ *
+ * @param {string}  folderPath  Absolute path to scan
+ * @param {number}  maxFiles    Max loose files to list (default 150)
+ * @param {boolean} deep        If true, also list files inside each subfolder
  */
-async function scanFolderForContext(folderPath, maxFiles = 150) {
+async function scanFolderForContext(folderPath, maxFiles = 150, deep = false) {
   try {
     const dirents = await fs.readdir(folderPath, { withFileTypes: true });
     const files = [];
+    const subfolders = [];
+
     for (const entry of dirents) {
-      if (!entry.isFile()) continue;
-      const fullPath = path.join(folderPath, entry.name);
-      try {
-        const stat = await fs.stat(fullPath);
-        files.push({ name: entry.name, sizeBytes: stat.size });
-      } catch { /* skip unreadable */ }
+      if (entry.isFile()) {
+        const fullPath = path.join(folderPath, entry.name);
+        try {
+          const stat = await fs.stat(fullPath);
+          files.push({ name: entry.name, sizeBytes: stat.size, isSubfolder: false });
+        } catch { /* skip unreadable */ }
+      } else if (entry.isDirectory()) {
+        subfolders.push(entry.name);
+      }
     }
-    // Sort by size descending so largest files appear first — helps agent answer size questions
+
+    // Sort loose files by size descending
     files.sort((a, b) => b.sizeBytes - a.sizeBytes);
-    return files.slice(0, maxFiles);
+    const topFiles = files.slice(0, maxFiles);
+
+    // Include subfolder names so structure queries can see the organised folders
+    const result = [...topFiles];
+    for (const sub of subfolders) {
+      result.push({ name: `${sub}/`, sizeBytes: null, isSubfolder: true });
+      if (deep) {
+        try {
+          const subEntries = await fs.readdir(path.join(folderPath, sub), { withFileTypes: true });
+          for (const se of subEntries) {
+            if (se.isFile()) {
+              try {
+                const sp = path.join(folderPath, sub, se.name);
+                const st = await fs.stat(sp);
+                result.push({ name: `  ${sub}/${se.name}`, sizeBytes: st.size, isSubfolder: false });
+              } catch { /* skip */ }
+            }
+          }
+        } catch { /* skip unreadable subfolder */ }
+      }
+    }
+
+    return result;
   } catch {
     return [];
   }
@@ -126,17 +165,27 @@ async function scanFolderForContext(folderPath, maxFiles = 150) {
 
 /**
  * Format a file list as a compact text block for the system prompt.
+ * Entries that are subfolder names (isSubfolder=true) are displayed with a
+ * different prefix so the agent understands the current folder layout.
  */
 function formatFileListForPrompt(folderLabel, files) {
   if (files.length === 0) return `${folderLabel}: (empty or no access)`;
   const lines = files.map((f) => {
-    const kb = f.sizeBytes < 1024 ? `${f.sizeBytes}B`
+    if (f.isSubfolder) return `  [folder] ${f.name}`;
+    const kb = !f.sizeBytes ? '—'
+      : f.sizeBytes < 1024 ? `${f.sizeBytes}B`
       : f.sizeBytes < 1048576 ? `${(f.sizeBytes/1024).toFixed(0)}KB`
       : f.sizeBytes < 1073741824 ? `${(f.sizeBytes/1048576).toFixed(1)}MB`
       : `${(f.sizeBytes/1073741824).toFixed(2)}GB`;
     return `  - ${f.name} (${kb})`;
   });
-  return `${folderLabel} (${files.length} files):\n${lines.join('\n')}`;
+  const fileCount = files.filter((f) => !f.isSubfolder).length;
+  const folderCount = files.filter((f) => f.isSubfolder).length;
+  const summary = [
+    fileCount > 0 && `${fileCount} loose file${fileCount === 1 ? '' : 's'}`,
+    folderCount > 0 && `${folderCount} subfolder${folderCount === 1 ? '' : 's'}`,
+  ].filter(Boolean).join(', ');
+  return `${folderLabel} (${summary}):\n${lines.join('\n')}`;
 }
 
 /**
@@ -168,18 +217,25 @@ function detectRelevantFolders(message, defaultFolders) {
 /**
  * Build a file system context string to inject into the system prompt.
  * This gives the agent real data to answer questions accurately.
+ *
+ * For structure / "show me" queries we do a deep scan (1 level into each
+ * subfolder) so the agent sees the organised state of the folder, not just
+ * the loose files sitting at the root.
  */
 async function buildFileSystemContext(message, defaultFolders) {
   const relevantFolders = detectRelevantFolders(message, defaultFolders);
   const sections = [];
 
+  // A "structure" query should show subfolders and their contents
+  const isStructureQuery = /\b(structure|show|list|what.*in|content|organised|organized|after.*organis|after.*organiz)\b/i.test(message);
+
   for (const folder of relevantFolders) {
-    const files = await scanFolderForContext(folder.path, 200);
+    const files = await scanFolderForContext(folder.path, 200, isStructureQuery);
     sections.push(formatFileListForPrompt(folder.label, files));
   }
 
   if (sections.length === 0) return '';
-  return '\n\nCURRENT FILE SYSTEM CONTEXT (real data from this machine):\n' + sections.join('\n\n');
+  return '\n\nCURRENT FILE SYSTEM CONTEXT (real live data from disk — reflects any recent changes):\n' + sections.join('\n\n');
 }
 
 // ─── System prompt ────────────────────────────────────────────────────────────
@@ -187,7 +243,8 @@ async function buildFileSystemContext(message, defaultFolders) {
 function buildSystemPrompt(context) {
   return [
     'You are SmartDesk AI, a desktop file organizer assistant running on the user\'s computer.',
-    'You have been given REAL file system data below — use it to answer questions accurately.',
+    'You have been given REAL, LIVE file system data below — use it to answer questions accurately.',
+    'IMPORTANT: The file system context below was just read from disk right now. It reflects the current actual state of the folders, including any recent organising or moves. Always trust this injected data over anything in conversation history.',
     'Interpret the user message and choose exactly one intent.',
     'Be conversational, friendly, and concise in the reply field.',
     'Never claim a file was moved, deleted, or renamed already. File changes require approval first.',
@@ -215,6 +272,7 @@ function buildSystemPrompt(context) {
     'For find_file, set query to the cleaned search phrase only (no greetings or filler words). Use the file system context to confirm if the file exists and mention it in the reply.',
     'For count_folder_items, answer the count directly from the file system context above.',
     'For largest/smallest file questions, inspect the file system context and answer with the filename and size.',
+    'When the user asks to "show structure", "show what is in", or "list contents" of a folder, use type "chat" and describe the current folder layout using the injected file system context (subfolders and files listed above).',
     'If you are missing details for an action, keep the reply conversational and set type to chat.',
     'Examples:',
     '{"reply":"I found resume.pdf in Downloads (245KB).","intent":{"type":"find_file","query":"resume","source":null,"destination":null,"folderHint":"Downloads"}}',
@@ -1369,6 +1427,12 @@ async function executePlan(planId) {
 
   planStore.delete(planId);
 
+  // ── Record that this folder was recently organized so structure queries
+  //    get a guaranteed fresh scan instead of relying on thread memory ────────
+  if (plan.sourcePath) {
+    lastOrganizedAt.set(plan.sourcePath, Date.now());
+  }
+
   const totalProcessed = movedCount + deletedCount + movedFolderCount;
 
   if (plan.type === INTENT.DELETE_FILE) {
@@ -1580,10 +1644,71 @@ async function processChatMessage(message, incomingThreadId = null) {
   return normalized;
 }
 
+/**
+ * Return a fresh, human-readable folder structure for the given label.
+ * Always reads from disk — never uses any cache or thread memory.
+ */
+async function getFolderStructure(folderLabel) {
+  const resolved = resolveFolderRef(folderLabel);
+  if (!resolved) {
+    return { ok: false, message: `Could not resolve folder: ${folderLabel}` };
+  }
+  const exists = await ensureFolderExists(resolved.path);
+  if (!exists) {
+    return { ok: false, message: `Folder "${resolved.label}" was not found on this device.` };
+  }
+
+  const entries = await scanFolderForContext(resolved.path, 300, true);
+
+  const lines = [];
+  lines.push(`📁 ${resolved.label}/`);
+
+  const subfolders = entries.filter((e) => e.isSubfolder);
+  const looseFiles = entries.filter((e) => !e.isSubfolder && !e.name.includes('/'));
+
+  for (const sub of subfolders) {
+    const subName = sub.name.replace(/\/$/, '');
+    lines.push(`  📂 ${subName}/`);
+    const children = entries.filter((e) => !e.isSubfolder && e.name.startsWith(`  ${subName}/`));
+    for (const child of children) {
+      const fname = child.name.replace(`  ${subName}/`, '');
+      const kb = !child.sizeBytes ? '—'
+        : child.sizeBytes < 1024 ? `${child.sizeBytes}B`
+        : child.sizeBytes < 1048576 ? `${(child.sizeBytes / 1024).toFixed(0)}KB`
+        : `${(child.sizeBytes / 1048576).toFixed(1)}MB`;
+      lines.push(`    📄 ${fname} (${kb})`);
+    }
+  }
+
+  for (const f of looseFiles) {
+    const kb = !f.sizeBytes ? '—'
+      : f.sizeBytes < 1024 ? `${f.sizeBytes}B`
+      : f.sizeBytes < 1048576 ? `${(f.sizeBytes / 1024).toFixed(0)}KB`
+      : `${(f.sizeBytes / 1048576).toFixed(1)}MB`;
+    lines.push(`  📄 ${f.name} (${kb})`);
+  }
+
+  const looseCount = looseFiles.length;
+  const subCount = subfolders.length;
+  const summary = [
+    subCount > 0 && `${subCount} subfolder${subCount === 1 ? '' : 's'}`,
+    looseCount > 0 && `${looseCount} loose file${looseCount === 1 ? '' : 's'}`,
+  ].filter(Boolean).join(', ') || 'empty';
+
+  return {
+    ok: true,
+    label: resolved.label,
+    path: resolved.path,
+    summary,
+    structure: lines.join('\n'),
+  };
+}
+
 module.exports = {
   INTENT,
   extractSpecificFile,
   processChatMessage,
   buildScanPlan: handleScanStructureIntent,
   executePlan,
+  getFolderStructure,
 };

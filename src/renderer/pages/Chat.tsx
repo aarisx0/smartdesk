@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
-  Send, Mic, Zap, Bot, X, ChevronRight,
+  Send, Mic, Zap, Bot, X, ChevronRight, Eye,
   FolderOpen, FolderSearch, Copy, HardDrive,
   FileText, FileImage, FileVideo, FileAudio, FileCode,
   FileSpreadsheet, FileArchive, File,
@@ -401,7 +401,7 @@ function MarkdownRenderer({ text }: { text: string }) {
 
 // ─── message renderers ────────────────────────────────────────────────────────
 
-interface MsgProps { msg: ChatMessage; onApprovalCta?: () => void }
+interface MsgProps { msg: ChatMessage; onApprovalCta?: () => void; onDetailsCta?: () => void }
 
 /** User bubble — right-aligned gradient */
 function UserBubble({ msg }: MsgProps) {
@@ -450,12 +450,16 @@ function AITextBubble({ msg }: MsgProps) {
 }
 
 /** AI action summary card */
-function AIActionCard({ msg, onApprovalCta }: MsgProps) {
+function AIActionCard({ msg, onApprovalCta, onDetailsCta }: MsgProps) {
   if (msg.payload.type !== 'action') return null;
   const { action } = msg.payload;
   const Icon = ICON_MAP[action.icon] ?? FolderOpen;
 
   const glowColor = action.count === 0 ? '#34D399' : '#818CF8';
+
+  // Only show Details button for plan-backed actions (those that open the approval modal)
+  const isPlanAction =
+    action.ctaTarget === 'chat-approval-plan' || action.ctaTarget === 'approval';
 
   return (
     <motion.div
@@ -501,14 +505,38 @@ function AIActionCard({ msg, onApprovalCta }: MsgProps) {
           )}
         </div>
 
-        {/* CTA button */}
+        {/* CTA buttons row */}
         {action.cta && (
-          <div className="px-4 py-3">
+          <div className="px-4 py-3 flex items-center gap-2 flex-wrap">
+            {/* Details button — only for plan actions */}
+            {isPlanAction && (
+              <motion.button
+                whileHover={{ scale: 1.03 }}
+                whileTap={{ scale: 0.97 }}
+                onClick={() => {
+                  if (action.ctaTarget === 'approval' || action.ctaTarget === 'chat-approval-plan')
+                    onDetailsCta?.();
+                }}
+                className="flex items-center gap-2 text-xs font-semibold px-4 py-2 rounded-xl
+                           transition-all duration-150"
+                style={{
+                  background: 'rgba(129,140,248,0.12)',
+                  color: '#818CF8',
+                  border: '1px solid rgba(129,140,248,0.25)',
+                }}
+              >
+                <Eye size={12} />
+                Details
+              </motion.button>
+            )}
+
+            {/* Primary approve/action button */}
             <motion.button
               whileHover={{ scale: 1.03 }}
               whileTap={{ scale: 0.97 }}
               onClick={() => {
-                if (action.ctaTarget === 'approval' || action.ctaTarget === 'chat-approval-plan') onApprovalCta?.();
+                if (action.ctaTarget === 'approval' || action.ctaTarget === 'chat-approval-plan')
+                  onApprovalCta?.();
               }}
               className="flex items-center gap-2 text-xs font-semibold px-4 py-2 rounded-xl
                          transition-all duration-150"
@@ -675,12 +703,12 @@ function SmartDeskAvatar() {
 }
 
 /** Route a message to the right renderer */
-function MessageRenderer({ msg, onApprovalCta }: { msg: ChatMessage; onApprovalCta?: () => void }) {
+function MessageRenderer({ msg, onApprovalCta, onDetailsCta }: { msg: ChatMessage; onApprovalCta?: () => void; onDetailsCta?: () => void }) {
   if (msg.role === 'user') return <UserBubble msg={msg} />;
 
   switch (msg.payload.type) {
     case 'text':      return <AITextBubble msg={msg} />;
-    case 'action':    return <AIActionCard msg={msg} onApprovalCta={onApprovalCta} />;
+    case 'action':    return <AIActionCard msg={msg} onApprovalCta={onApprovalCta} onDetailsCta={onDetailsCta} />;
     case 'file-list': return <AIFileListCard msg={msg} />;
     case 'stats':     return <AIStatsCard msg={msg} />;
     case 'error':     return <AIErrorBubble msg={msg} />;
@@ -888,6 +916,8 @@ export default function Chat() {
 
   const [modalOpen, setModalOpen] = useState(false);
   const [planModalOpen, setPlanModalOpen] = useState(false);
+  // 'approve' = normal flow; 'details' = read-only details view
+  const [planModalMode, setPlanModalMode] = useState<'approve' | 'details'>('approve');
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -901,13 +931,29 @@ export default function Chat() {
   // Register the open-modal callback so the hook can open it directly.
   // This runs once on mount and stays stable — no stale closure issues.
   useEffect(() => {
-    openPlanModalRef.current = () => setPlanModalOpen(true);
+    openPlanModalRef.current = () => {
+      setPlanModalMode('approve');
+      setPlanModalOpen(true);
+    };
     return () => { openPlanModalRef.current = null; };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Opens modal in approve mode (standard)
   const handleApprovalCta = useCallback(() => {
-    if (approvalPlan) setPlanModalOpen(true);
-    else setModalOpen(true);
+    if (approvalPlan) {
+      setPlanModalMode('approve');
+      setPlanModalOpen(true);
+    } else {
+      setModalOpen(true);
+    }
+  }, [approvalPlan]);
+
+  // Opens modal in details/read-only mode — user can inspect plan then decide
+  const handleDetailsCta = useCallback(() => {
+    if (approvalPlan) {
+      setPlanModalMode('details');
+      setPlanModalOpen(true);
+    }
   }, [approvalPlan]);
 
   return (
@@ -940,7 +986,12 @@ export default function Chat() {
           <div className="flex flex-col">
             <AnimatePresence initial={false}>
               {messages.map((msg) => (
-                <MessageRenderer key={msg.id} msg={msg} onApprovalCta={handleApprovalCta} />
+                <MessageRenderer
+                  key={msg.id}
+                  msg={msg}
+                  onApprovalCta={handleApprovalCta}
+                  onDetailsCta={handleDetailsCta}
+                />
               ))}
             </AnimatePresence>
             <AnimatePresence>
@@ -1004,6 +1055,7 @@ export default function Chat() {
       {planModalOpen && approvalPlan && (
         <ChatApprovalModal
           plan={approvalPlan}
+          mode={planModalMode}
           onClose={() => setPlanModalOpen(false)}
           onCancel={() => { setPlanModalOpen(false); clearApprovalPlan(); }}
           onApproved={(message) => {

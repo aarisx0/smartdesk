@@ -397,7 +397,7 @@ export function useChat() {
             icon:      'Sparkles',
             count:     data.intent.approvalPlan.count,
             detail:    data.intent.approvalPlan.detail,
-            cta:       'Review & Approve',
+            cta:       'Approve & Organise',
             ctaTarget: 'chat-approval-plan',
           }});
           return;
@@ -437,6 +437,36 @@ export function useChat() {
         }});
       } catch (err) {
         push('assistant', { type: 'error', text: `Failed: ${(err as Error).message}` });
+      }
+    });
+  }, [withTyping, push]);
+
+  /**
+   * Show a live folder structure — always reads from disk via /api/chat/structure.
+   * Used when user asks "show me the structure of Downloads" (especially after organizing).
+   */
+  const handleShowStructure = useCallback(async (folderHint: string) => {
+    await withTyping(async () => {
+      await delay(250);
+      try {
+        const res = await fetch(`${API}/api/chat/structure`, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ folder: folderHint }),
+        });
+        const data = await res.json() as { ok: boolean; label?: string; structure?: string; summary?: string; message?: string };
+
+        if (!data.ok) {
+          push('assistant', { type: 'text', text: data.message || `Could not read the structure of **${folderHint}**.` });
+          return;
+        }
+
+        push('assistant', {
+          type: 'text',
+          text: `Here is the current structure of **${data.label}** (${data.summary}):\n\n\`\`\`\n${data.structure}\n\`\`\``,
+        });
+      } catch (err) {
+        push('assistant', { type: 'error', text: `Structure read failed: ${(err as Error).message}` });
       }
     });
   }, [withTyping, push]);
@@ -611,6 +641,29 @@ export function useChat() {
       }
       await handleScanStructure(folderHint || 'Desktop', text);
       return;
+    }
+
+    // ── Fast path: "show structure / what's in / list contents" queries ───────
+    // These always read from disk directly — never from IBM thread memory.
+    const STRUCTURE_KEYWORDS = /\b(show\s+(me\s+)?(the\s+)?structure|what('?s|\s+is)\s+in|list\s+(the\s+)?(contents?|files?)|what\s+(files?|folders?)\s+are\s+in|show\s+(files?|folders?)\s+in|folder\s+structure|current\s+structure)\b/i;
+
+    if (STRUCTURE_KEYWORDS.test(text) && FOLDER_NAMES.test(text)) {
+      const FMAP: Record<string, string> = {
+        desktop: 'Desktop', downloads: 'Downloads', download: 'Downloads',
+        documents: 'Documents', document: 'Documents',
+        pictures: 'Pictures', picture: 'Pictures',
+        images: 'Pictures', image: 'Pictures',
+        videos: 'Videos', music: 'Music',
+      };
+      let folderHint = '';
+      const tl = text.toLowerCase();
+      for (const [alias, canonical] of Object.entries(FMAP)) {
+        if (tl.includes(alias)) { folderHint = canonical; break; }
+      }
+      if (folderHint) {
+        await handleShowStructure(folderHint);
+        return;
+      }
     }
 
     await withTyping(async () => {
@@ -894,6 +947,7 @@ export function useChat() {
   }, [
     typing, setPlan, push, withTyping, runLocalRouting,
     handleFindFile, handleDuplicates, handlePending, handleCleanFolder, handleScanStructure,
+    handleShowStructure,
     tryBuildOrganizeApprovalPlan,
   ]);
 
