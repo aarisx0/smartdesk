@@ -224,8 +224,15 @@ export function useChat() {
     approvalPlanRef.current = plan;
     setApprovalPlan(plan);
     if (plan) {
+      // A real plan is ready — clear any stale pending operation so it
+      // never interferes with the next request.
+      pendingOperationRef.current = null;
       // Use setTimeout so Chat.tsx has rendered and registered openPlanModalRef
       setTimeout(() => openPlanModalRef.current?.(), 0);
+    } else {
+      // Plan cleared (cancelled or approved) — also wipe pending so the next
+      // request starts with a clean slate.
+      pendingOperationRef.current = null;
     }
   }, []);
 
@@ -362,30 +369,27 @@ export function useChat() {
     });
   }, [withTyping, push]);
 
-  const handleScanStructure = useCallback(async (hint: string) => {
+  const handleScanStructure = useCallback(async (hint: string, requestText?: string) => {
     await withTyping(async () => {
+      // Normalise the folder label for display
       const folderLabel = hint
-        ? hint.replace(/^(scan|analyse?|analyze|check)\s*/i, '').trim() || 'your folders'
+        ? hint.replace(/^(scan|analyse?|analyze|check)\s*/i, '').trim() || hint
         : 'your watched folders';
 
       push('assistant', { type: 'text', text: `Scanning **${folderLabel}** and preparing an organisation plan…` });
       await delay(400);
 
       try {
-        // Ask the backend directly with a scan_structure-triggering message
-        const requestMsg = hint
-          ? `scan the ${hint} folder and suggest how to organize the files`
-          : `scan my watched folders and suggest how to organize the files`;
-
-        const res = await fetch(`${API}/api/chat`, {
-          method: 'POST',
+        // ── Direct scan — never goes through IBM agent ──────────────────────
+        const res = await fetch(`${API}/api/chat/scan`, {
+          method:  'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: requestMsg, threadId: threadIdRef.current }),
+          body:    JSON.stringify({ folder: hint || null }),
         });
         const data = await res.json() as AgentResponse;
-        if (data.threadId) threadIdRef.current = data.threadId;
 
         if (data.intent?.approvalPlan) {
+          // Plan found — setPlan clears pendingOperationRef automatically
           setPlan(data.intent.approvalPlan);
           push('assistant', { type: 'text', text: data.reply || `I found files to organise in **${folderLabel}**.` });
           push('assistant', { type: 'action', action: {
@@ -399,13 +403,18 @@ export function useChat() {
           return;
         }
 
-        // Backend says nothing to organise
+        // Nothing to organise in this folder — store pending so "yes" can retry
+        pendingOperationRef.current = {
+          type: 'organize',
+          source: hint || 'Desktop',
+          requestText: requestText || hint,
+        };
         push('assistant', { type: 'text', text: data.reply || `**${folderLabel}** looks clean — no loose files need organising right now.` });
       } catch (err) {
         push('assistant', { type: 'error', text: `Scan failed: ${(err as Error).message}` });
       }
     });
-  }, [withTyping, push]);
+  }, [withTyping, push, setPlan]);
 
   const handlePending = useCallback(async () => {
     await withTyping(async () => {
@@ -468,8 +477,18 @@ export function useChat() {
     if (CMD.storageReport.test(t)) { await handleStorageReport(); return true; }
 
     if (CMD.scanStructure.test(t)) {
-      const scanMatch = text.match(CMD.scanStructure);
-      await handleScanStructure(scanMatch?.[0] ?? '');
+      // Extract which folder the user mentioned; fall back to Desktop if none
+      const FOLDER_MAP: Record<string, string> = {
+        desktop: 'Desktop', downloads: 'Downloads', download: 'Downloads',
+        documents: 'Documents', document: 'Documents',
+        pictures: 'Pictures', picture: 'Pictures',
+        videos: 'Videos', music: 'Music',
+      };
+      let folderHint = '';
+      for (const [alias, canonical] of Object.entries(FOLDER_MAP)) {
+        if (t.includes(alias)) { folderHint = canonical; break; }
+      }
+      await handleScanStructure(folderHint);
       return true;
     }
 
@@ -571,6 +590,29 @@ export function useChat() {
 
     push('user', { type: 'text', text });
 
+    // ── Fast path: scan/organize requests skip the IBM agent entirely ─────────
+    // We detect these locally and call handleScanStructure directly so the plan
+    // is always built correctly regardless of IBM agent availability or response format.
+    const SCAN_KEYWORDS = /\b(scan|organis[e]?|organiz[e]?|clean\s*up|reorganis[e]?|reorganiz[e]?|suggest.*organiz|give.*suggestion.*scan|suggestion.*folder|structure.*organiz)\b/i;
+    const FOLDER_NAMES = /\b(desktop|downloads?|documents?|pictures?|images?|videos?|music)\b/i;
+
+    if (SCAN_KEYWORDS.test(text) && FOLDER_NAMES.test(text)) {
+      const FMAP: Record<string, string> = {
+        desktop: 'Desktop', downloads: 'Downloads', download: 'Downloads',
+        documents: 'Documents', document: 'Documents',
+        pictures: 'Pictures', picture: 'Pictures',
+        images: 'Pictures', image: 'Pictures',
+        videos: 'Videos', music: 'Music',
+      };
+      let folderHint = '';
+      const tl = text.toLowerCase();
+      for (const [alias, canonical] of Object.entries(FMAP)) {
+        if (tl.includes(alias)) { folderHint = canonical; break; }
+      }
+      await handleScanStructure(folderHint || 'Desktop', text);
+      return;
+    }
+
     await withTyping(async () => {
       await delay(220);
 
@@ -660,18 +702,22 @@ export function useChat() {
               pendingOperationRef.current = { type: 'move', source: src, destination: dst, specificFile };
             }
           } else if (/\b(organis|organiz|clean up|sort|reorganis|reorganiz)\b/.test(replyLower)) {
-            // Only store a pending context if no plan was already built
+            // IBM agent gave a rich suggestion reply — immediately scan and build
+            // a real plan rather than waiting for the user to say "proceed".
             if (!data.intent?.approvalPlan) {
+              // Extract folder from user message first, then reply text
               let src: string | null = null;
-              const fromMatch = replyLower.match(/(?:in|from)\s+(?:the\s+)?(?:your\s+)?([a-z]+)\s*(?:folder)?/i);
-              if (fromMatch) src = FOLDER_MAP[fromMatch[1].toLowerCase()] ?? null;
-              if (!src) {
-                const msgLower = text.toLowerCase();
-                for (const [alias, canonical] of Object.entries(FOLDER_MAP)) {
-                  if (msgLower.includes(alias)) { src = canonical; break; }
-                }
+              const msgLower = text.toLowerCase();
+              for (const [alias, canonical] of Object.entries(FOLDER_MAP)) {
+                if (msgLower.includes(alias)) { src = canonical; break; }
               }
-              pendingOperationRef.current = { type: 'organize', source: src || 'watched folders', requestText: text };
+              if (!src) {
+                const fromMatch = replyLower.match(/(?:in|from|for)\s+(?:the\s+)?(?:your\s+)?([a-z]+)\s*(?:folder)?/i);
+                if (fromMatch) src = FOLDER_MAP[fromMatch[1].toLowerCase()] ?? null;
+              }
+              const targetFolder = src || 'Desktop';
+              // Kick off the direct scan immediately (non-blocking — runs in parallel with reply display)
+              setTimeout(() => handleScanStructure(targetFolder, text), 0);
             }
           }
 
@@ -684,14 +730,24 @@ export function useChat() {
               pendingOperationRef.current = { type: 'delete', source: src, specificFile: hintedFile };
             } else if (intentType === 'move_files' && src && dst) {
               pendingOperationRef.current = { type: 'move', source: src, destination: dst, specificFile: hintedFile };
-            } else if (intentType === 'organize_folder' && src) {
-              pendingOperationRef.current = { type: 'organize', source: src, requestText: text };
-            } else if (intentType === 'scan_structure') {
-              pendingOperationRef.current = {
-                type: 'organize',
-                source: src || 'watched folders',
-                requestText: text,
-              };
+            } else if (intentType === 'organize_folder' || intentType === 'scan_structure') {
+              // Extract folder from user message (most reliable) then fall back to intent
+              const msgFolder = (() => {
+                const tl = text.toLowerCase();
+                const FM: Record<string, string> = {
+                  desktop: 'Desktop', downloads: 'Downloads', download: 'Downloads',
+                  documents: 'Documents', document: 'Documents',
+                  pictures: 'Pictures', picture: 'Pictures',
+                  videos: 'Videos', music: 'Music',
+                };
+                for (const [alias, canonical] of Object.entries(FM)) {
+                  if (tl.includes(alias)) return canonical;
+                }
+                return null;
+              })();
+              const targetFolder = msgFolder || src || 'Desktop';
+              // Scan immediately — don't wait for "proceed"
+              setTimeout(() => handleScanStructure(targetFolder, text), 0);
             }
           }
         }
@@ -734,11 +790,10 @@ export function useChat() {
             return;
           }
           case 'scan_structure': {
-            // If the backend already built a real scan plan — use it directly
+            // If the backend already built a real scan plan — use it directly.
+            // setPlan() now also clears pendingOperationRef.
             if (intent?.approvalPlan) {
               setPlan(intent.approvalPlan);
-              // Clear any pending operation — the plan IS the next action, not a "yes" trigger
-              pendingOperationRef.current = null;
               push('assistant', { type: 'action', action: {
                 label:     intent.approvalPlan.title,
                 icon:      'Sparkles',
@@ -749,29 +804,24 @@ export function useChat() {
               }});
               return;
             }
-            // No plan returned (folder is already clean) — reply already shown above.
-            // Extract the specific folder from the original user message so "yes" retries
-            // exactly that folder, not all watched folders.
+            // No plan from backend — extract folder from user message and scan directly.
+            // Do NOT preset pendingOperationRef here; handleScanStructure will set it
+            // only if no plan comes back (folder already clean).
             const hintFromMsg = (() => {
-              const t = text.toLowerCase();
-              const FOLDER_MAP: Record<string, string> = {
+              const tl = text.toLowerCase();
+              const FM: Record<string, string> = {
                 desktop: 'Desktop', downloads: 'Downloads', download: 'Downloads',
                 documents: 'Documents', document: 'Documents',
                 pictures: 'Pictures', picture: 'Pictures',
                 videos: 'Videos', music: 'Music',
               };
-              for (const [alias, canonical] of Object.entries(FOLDER_MAP)) {
-                if (t.includes(alias)) return canonical;
+              for (const [alias, canonical] of Object.entries(FM)) {
+                if (tl.includes(alias)) return canonical;
               }
               return '';
             })();
             const hint = intent?.folderHint?.trim() || intent?.source?.trim() || hintFromMsg;
-            pendingOperationRef.current = {
-              type: 'organize',
-              source: hint || 'Desktop',
-              requestText: text,
-            };
-            await handleScanStructure(hint || 'Desktop');
+            await handleScanStructure(hint || 'Desktop', text);
             return;
           }
           case 'show_duplicates':  await handleDuplicates();   return;
@@ -805,13 +855,21 @@ export function useChat() {
                 }
               } catch { /* fall through */ }
             }
-            // Single folder — use handleScanStructure which now calls the backend directly
-            pendingOperationRef.current = {
-              type: 'organize',
-              source: src || 'watched folders',
-              requestText: text,
-            };
-            await handleScanStructure(src || 'watched folders');
+            // Single folder — extract from message if intent didn't give one
+            const folderForScan = src || (() => {
+              const tl = text.toLowerCase();
+              const FM: Record<string, string> = {
+                desktop: 'Desktop', downloads: 'Downloads', download: 'Downloads',
+                documents: 'Documents', document: 'Documents',
+                pictures: 'Pictures', picture: 'Pictures',
+                videos: 'Videos', music: 'Music',
+              };
+              for (const [alias, canonical] of Object.entries(FM)) {
+                if (tl.includes(alias)) return canonical;
+              }
+              return 'Desktop';
+            })();
+            await handleScanStructure(folderForScan, text);
             return;
           }
           default:

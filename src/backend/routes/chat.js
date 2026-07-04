@@ -19,6 +19,26 @@ router.post('/', async (req, res) => {
   }
 });
 
+// Direct scan endpoint — bypasses IBM agent, always runs the local folder scan.
+// Accepts optional `folder` (label like "Desktop") to scope the scan.
+router.post('/scan', async (req, res) => {
+  const { folder } = req.body;
+  try {
+    const intent = {
+      type: orchestrateChat.INTENT.SCAN_STRUCTURE,
+      folderHint: folder || null,
+      source:     folder || null,
+      query:      null,
+      destination: null,
+    };
+    const result = await orchestrateChat.buildScanPlan(intent);
+    return res.json(result);
+  } catch (err) {
+    console.error('[chat scan]', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 router.post('/execute', async (req, res) => {
   const { planId } = req.body;
   if (!planId || typeof planId !== 'string') {

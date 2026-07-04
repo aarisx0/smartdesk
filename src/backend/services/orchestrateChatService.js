@@ -1584,5 +1584,6 @@ module.exports = {
   INTENT,
   extractSpecificFile,
   processChatMessage,
+  buildScanPlan: handleScanStructureIntent,
   executePlan,
 };
