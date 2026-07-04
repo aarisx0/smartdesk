@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; width: 100%; background: #0F0F1A; overflow: hidden; }
+  #root { width: 100%; height: 100%; }
+  #loading {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px;
+    background: #0F0F1A; color: #8B8BAD; font-family: 'Inter', sans-serif;
+    font-size: 13px; z-index: 999;
+  }
+  .dots { display: flex; gap: 6px; }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%; background: #4F46E5;
+    animation: bounce 1.2s infinite ease-in-out;
+  }
+  .dot:nth-child(2) { animation-delay: .2s; background: #6366f1; }
+  .dot:nth-child(3) { animation-delay: .4s; background: #7C3AED; }
+  @keyframes bounce {
+    0%, 80%, 100% { transform: scale(.6); opacity: .4; }
+    40%           { transform: scale(1);  opacity: 1; }
+  }
+  .err { color: #FCA5A5; font-size: 12px; text-align: center; max-width: 280px; line-height: 1.6; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<div id="loading">
+  <div class="dots"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>
+  <span>Connecting to IBM watsonx Orchestrate…</span>
+</div>
+
+<script>
+  window.wxOConfiguration = {
+    orchestrationID:    "c1156f23c6db487f9703ec3d91fdf09f_f01bf8d7-18cd-4dcc-8641-2dcda75e1599",
+    hostURL:            "https://au-syd.watson-orchestrate.cloud.ibm.com",
+    rootElementID:      "root",
+    deploymentPlatform: "ibmcloud",
+    crn:                "crn:v1:bluemix:public:watsonx-orchestrate:au-syd:a/c1156f23c6db487f9703ec3d91fdf09f:f01bf8d7-18cd-4dcc-8641-2dcda75e1599::",
+    chatOptions: {
+      agentId: "29847e54-fe41-4afe-8f00-1f1249f5e06a"
+    }
+  };
+
+  var _hideLoading = function() {
+    var el = document.getElementById('loading');
+    if (el) el.style.display = 'none';
+  };
+
+  var _showError = function(msg) {
+    var el = document.getElementById('loading');
+    if (el) {
+      el.innerHTML = '<div class="err">⚠ ' + msg + '<br/><br/>Make sure you are connected to the internet and try again.</div>';
+    }
+  };
+
+  // Poll until wxo mounts something into #root
+  var _pollForMount = function() {
+    var attempts = 0;
+    var iv = setInterval(function() {
+      attempts++;
+      var root = document.getElementById('root');
+      if (root && root.children.length > 0) {
+        clearInterval(iv);
+        setTimeout(_hideLoading, 500);
+      }
+      if (attempts > 80) { // 40 s
+        clearInterval(iv);
+        _showError('Agent did not load within 40 seconds.');
+      }
+    }, 500);
+  };
+
+  setTimeout(function() {
+    var script = document.createElement('script');
+    script.src = window.wxOConfiguration.hostURL + '/wxochat/wxoLoader.js?embed=true';
+
+    script.onload = function() {
+      try {
+        wxoLoader.init();
+        _pollForMount();
+      } catch(e) {
+        _showError('Failed to initialise agent: ' + e.message);
+      }
+    };
+
+    script.onerror = function() {
+      _showError('Could not load wxoLoader.js from IBM CDN.<br/>Check your internet connection.');
+    };
+
+    document.head.appendChild(script);
+  }, 0);
+</script>
+</body>
+</html>

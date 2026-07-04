@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SmartDesk AI — Orchestrate Bridge</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: #0f0f1a; color: #8B8BAD;
+                 font-family: monospace; font-size: 11px; overflow: hidden; }
+    #root  { width: 100%; height: 100vh; }
+    #status { padding: 8px 12px; color: #818cf8; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <div id="status">Initialising watsonx Orchestrate…</div>
+
+  <script>
+    // ═══════════════════════════════════════════════════════════════════
+    //  SmartDesk AI — Orchestrate Bridge
+    //
+    //  This hidden window loads the wxo embed widget.
+    //  - For FILE CLASSIFICATION: watsonx.js uses rule-based fallback
+    //    (the wxo embed widget is not scriptable for automated JSON calls)
+    //  - For CHAT: the WatsonxPanel in the renderer loads its own iframe
+    //    with the wxo embed for interactive free-form conversation
+    //
+    //  This page signals ready immediately so the app doesn't hang.
+    // ═══════════════════════════════════════════════════════════════════
+
+    var _agentReady = false;
+
+    function _signalReady() {
+      if (_agentReady) return;
+      _agentReady = true;
+      document.getElementById('status').textContent = '✓ Bridge ready';
+      console.log('[orchestrate] bridge ready');
+      if (window.__smartdeskBridge) {
+        window.__smartdeskBridge.signalReady();
+      }
+    }
+
+    // Signal ready immediately — classification uses rule-based fallback
+    // which is fast and reliable. The embed widget in Chat page handles
+    // interactive conversation.
+    _signalReady();
+
+    // window.classifyFileResult is checked by watsonx.js polling.
+    // Keeping it null makes watsonx.js fall through to rule-based fallback.
+    window.classifyFileResult = null;
+
+    // sendToAgent — reject immediately so watsonx.js uses fallback classifier
+    window.sendToAgent = function(text) {
+      return Promise.reject(new Error('Direct agent calls not supported — using rule-based fallback'));
+    };
+
+    console.log('[orchestrate] SmartDesk bridge initialised (rule-based mode)');
+  </script>
+</body>
+</html>

@@ -1,0 +1,582 @@
+Build a complete desktop application called SmartDesk AI 
+using Electron + React + Node.js + Supabase (PostgreSQL).
+
+SmartDesk AI is an intelligent file organization assistant 
+that monitors selected folders, classifies files using IBM 
+watsonx Orchestrate, and automatically organizes them with 
+user approval. It is NOT a file explorer replacement — it 
+works silently in the background as an AI layer on top of 
+the OS.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+UI DESIGN STANDARD — apply to every single screen
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Dark theme: deep navy/charcoal base (#0F0F1A)
+- Glassmorphism cards: semi-transparent with 
+  backdrop-blur, subtle white border
+- Gradient accents: electric blue to violet 
+  (#4F46E5 → #7C3AED)
+- Framer Motion: all transitions, hover effects, 
+  page changes, stagger animations
+- Micro-interactions: buttons scale on hover, 
+  cards lift with shadow on hover
+- Typography: Inter font, clean hierarchy
+- Glow effects on active elements and key stats
+- Neon-style accent highlights on numbers and CTAs
+- Lucide React icons throughout
+- Professional, modern, glossy, interactive, 
+  attractive — no cartoonish elements
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TECH STACK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Frontend:
+- React + Tailwind CSS + Framer Motion
+- Recharts for analytics
+- Lucide React for icons
+- Electron as desktop shell
+
+Backend:
+- Node.js + Express
+- Electron main process with IPC
+- Chokidar for file watching
+- crypto for MD5 hashing
+- mime-types for file type detection
+- pdf-parse for PDF content extraction
+- exiftool-vendored for exe metadata
+- electron-store for app settings
+- electron-auto-launch for startup
+- glob for filesystem search
+
+Database:
+- PostgreSQL via Supabase
+- Connection: pg (node-postgres) 
+- Supabase pooler Transaction mode port 6543
+- DATABASE_URL in .env:
+  postgresql://postgres.[ref]:[password]
+  @aws-0-[region].pooler.supabase.com:6543
+  /postgres?pgbouncer=true
+
+AI:
+- IBM watsonx Orchestrate via embed 
+  inside hidden Electron BrowserWindow
+  apikey: PEvPGjbd_5aqJvXl-2q2KltykfdwQCEzqaieGEfkwdez
+- hostURL: "https://au-syd.watson-orchestrate.cloud.ibm.com"
+- agentId: "29847e54-fe41-4afe-8f00-1f1249f5e06a"
+- crn: "crn:v1:bluemix:public:watsonx-orchestrate:au-syd:
+  a/c1156f23c6db487f9703ec3d91fdf09f:
+  f01bf8d7-18cd-4dcc-8641-2dcda75e1599::"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FOLDER STRUCTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+smartdesk-ai/
+├── src/
+│   ├── main/
+│   │   ├── index.js
+│   │   └── orchestrateWindow.js
+│   ├── renderer/
+│   │   ├── App.jsx
+│   │   ├── pages/
+│   │   │   ├── Dashboard.jsx
+│   │   │   ├── Chat.jsx
+│   │   │   ├── Analytics.jsx
+│   │   │   ├── Duplicates.jsx
+│   │   │   └── Settings.jsx
+│   │   └── components/
+│   │       ├── ApprovalModal.jsx
+│   │       ├── SearchResults.jsx
+│   │       └── Sidebar.jsx
+│   ├── backend/
+│   │   ├── watsonx.js
+│   │   ├── search.js
+│   │   ├── duplicates.js
+│   │   └── learning.js
+│   ├── db/
+│   │   ├── supabase.js
+│   │   ├── schema.sql
+│   │   └── queries.js
+│   ├── watcher/
+│   │   └── index.js
+│   └── orchestrate/
+│       └── index.html
+├── .env
+└── package.json
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DATABASE — PostgreSQL via Supabase
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Build src/db/supabase.js:
+- Use pg Pool with DATABASE_URL from .env
+- Pool: max 10, idleTimeoutMillis 30000, 
+  connectionTimeoutMillis 5000
+- Export db.query(text, params)
+- Test connection on startup, log result
+
+Build src/db/schema.sql (plain SQL to paste 
+into Supabase SQL Editor and run once):
+
+CREATE TABLE files (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  filename TEXT NOT NULL,
+  extension TEXT,
+  filepath TEXT UNIQUE NOT NULL,
+  size_bytes BIGINT,
+  mime_type TEXT,
+  content_preview TEXT,
+  status TEXT DEFAULT 'pending' 
+    CHECK (status IN 
+    ('pending','classified','moved','skipped')),
+  suggested_folder TEXT,
+  confidence_score FLOAT,
+  ai_reasoning TEXT,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE user_preferences (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  pattern_keyword TEXT,
+  extension TEXT,
+  ai_suggested_folder TEXT,
+  user_confirmed_folder TEXT,
+  times_confirmed INT DEFAULT 1,
+  is_learned_rule BOOLEAN DEFAULT false,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE activity_log (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  action TEXT CHECK (action IN 
+    ('moved','created','deleted','skipped')),
+  filename TEXT,
+  from_path TEXT,
+  to_path TEXT,
+  file_size_bytes BIGINT,
+  timestamp TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE sessions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  files_processed INT DEFAULT 0,
+  folders_created INT DEFAULT 0,
+  duplicates_removed INT DEFAULT 0,
+  storage_saved_bytes BIGINT DEFAULT 0,
+  session_date DATE DEFAULT CURRENT_DATE
+);
+
+CREATE TABLE duplicate_groups (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  file_hash TEXT,
+  filenames JSONB,
+  sizes JSONB,
+  recommended_keep TEXT,
+  resolved BOOLEAN DEFAULT false,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE OR REPLACE FUNCTION update_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN NEW.updated_at = now(); RETURN NEW; END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER files_updated_at
+BEFORE UPDATE ON files
+FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+CREATE INDEX ON files(status);
+CREATE INDEX ON files(extension);
+CREATE INDEX ON activity_log(timestamp);
+CREATE INDEX ON user_preferences(pattern_keyword);
+
+Build src/db/queries.js with these functions 
+using db.query():
+- insertFile(metadata) → INSERT into files, return id
+- updateFileStatus(id, status, suggestedFolder, 
+  confidence, reasoning) → UPDATE files
+- getPendingFiles() → SELECT WHERE status = pending
+- getClassifiedFiles() → SELECT WHERE status = classified
+- logActivity(action, filename, fromPath, 
+  toPath, sizeBytes) → INSERT into activity_log
+- savePreference(keyword, ext, aiFolder, userFolder) 
+  → INSERT or ON CONFLICT increment times_confirmed
+- getLearnedRules() → SELECT WHERE is_learned_rule = true
+- getTodaySession() → SELECT or INSERT today's session
+- updateSession(id, filesProcessed, foldersCreated, 
+  duplicatesRemoved, storageSaved) → UPDATE sessions
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILE WATCHER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Build src/watcher/index.js:
+- Watch Desktop and Downloads folders by default
+  (configurable via electron-store)
+- Ignore: .tmp .crdownload .part files
+- On new file detected:
+  * Wait 2 seconds (debounce, avoids mid-download)
+  * Extract: filename, extension, full path, 
+    size in bytes, MIME type using mime-types,
+    created/modified date
+  * For .pdf: extract first 300 chars using pdf-parse
+  * For .txt .md: extract first 300 chars using fs
+  * For .exe .msi: extract product name using 
+    exiftool-vendored
+  * Emit IPC event "file:detected" with full 
+    metadata object to Electron main process
+  * Insert into Supabase files table 
+    with status "pending"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+IBM WATSONX ORCHESTRATE INTEGRATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Since watsonx Orchestrate trial only provides 
+an embed script (no direct REST API), integrate 
+using a hidden Electron BrowserWindow approach.
+
+Build src/main/orchestrateWindow.js:
+- Create BrowserWindow: show false, 
+  width 800, height 600
+- Load src/orchestrate/index.html
+- Keep alive for entire app session
+- Export getOrchestrateWindow()
+
+Build src/orchestrate/index.html:
+- Load watsonx Orchestrate embed script:
+  hostURL: "https://au-syd.watson-orchestrate.cloud.ibm.com"
+  agentId: "29847e54-fe41-4afe-8f00-1f1249f5e06a"
+  crn: "crn:v1:bluemix:public:watsonx-orchestrate:au-syd:
+  a/c1156f23c6db487f9703ec3d91fdf09f:
+  f01bf8d7-18cd-4dcc-8641-2dcda75e1599::"
+- After agent loads expose:
+  * window.sendToAgent(text) — injects message 
+    into chat widget
+  * window.classifyFileResult — stores latest 
+    agent response
+- Use MutationObserver to detect agent response 
+  in chat DOM and store in classifyFileResult
+
+Build src/backend/watsonx.js:
+- classifyFile(metadata) async function:
+  * Input: { filename, extension, mime_type, 
+    size_bytes, content_preview }
+  * Check Supabase user_preferences for learned 
+    rule matching keyword + extension first
+  * If learned rule: return it, confidence 1.0
+  * Check Supabase files: if same filename 
+    classified before, reuse cached result
+  * Otherwise build message:
+    "filename=[x], extension=[x], size=[x]MB, 
+     mime_type=[x], content_preview=[x]"
+  * executeJavaScript on hidden window:
+    window.sendToAgent(message)
+  * Poll window.classifyFileResult every 500ms
+  * Timeout after 15 seconds
+  * Strip markdown backticks if present, 
+    parse response as JSON
+  * Update Supabase: status = classified,
+    suggested_folder, confidence_score, ai_reasoning
+  * Return: { category, subfolder, 
+    suggested_full_path, confidence, reasoning }
+  * On failure: return { category: "Unknown", 
+    confidence: 0, reasoning: "Service unavailable" }
+
+On app startup:
+- Create hidden orchestrate window
+- Wait 5 seconds for agent to fully load
+- Show "Connecting to SmartDesk AI..." splash screen
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DASHBOARD PAGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Build src/renderer/pages/Dashboard.jsx:
+- Left sidebar (collapsible): app logo with 
+  gradient glow, nav items with active highlight
+  (Dashboard, Chat, Analytics, Duplicates, Settings)
+- Top bar: greeting by time of day, watched folder 
+  pill badges, notification bell with count
+- Stats row (4 animated glow cards): 
+  Files Organized Today, Folders Created, 
+  Duplicates Removed, Storage Saved
+  Numbers count up on load with Framer Motion
+- Desktop Health: RadialBarChart (recharts), 
+  color coded green/yellow/red by percentage
+- Recently Organized table: file icon, filename, 
+  from path strikethrough → to path in accent color, 
+  confidence badge, time ago
+  Rows slide in with stagger animation
+- Pending Approvals panel: files awaiting action,
+  Approve (green glow) and Skip (red) buttons per row
+- Live data from Supabase, refresh every 30 seconds
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+APPROVAL MODAL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Build src/renderer/components/ApprovalModal.jsx:
+- Full screen overlay with backdrop blur
+- Modal slides in from bottom with spring animation
+- Header: "Organization Plan", file count badge, 
+  close button
+- File list rows: file type icon, filename, 
+  current path → arrow → suggested path, 
+  confidence badge (green >80%, yellow 50-80%, 
+  red <50%), expand to show AI reasoning
+- Bulk select checkboxes + Select All toggle
+- "Show Low Confidence Only" filter toggle
+- Sticky footer: storage to be freed preview,
+  "Approve Selected" gradient glow button,
+  "Approve All" button, "Cancel" button
+- After Approve: animated progress bar per file,
+  green checkmarks appearing one by one
+- Completion screen: confetti animation + 
+  summary card "X files organized, Y folders created"
+- CRITICAL: No files move until user clicks Approve
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CHAT ASSISTANT PAGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Build src/renderer/pages/Chat.jsx with TWO modes:
+
+MODE 1 — SmartDesk Command Mode (default):
+- Chat area: user messages right (gradient bubble),
+  AI responses left (glass card + SmartDesk avatar)
+- AI response cards: structured with icon, 
+  action summary, files affected count, 
+  "View Details" link
+- Messages animate in with Framer Motion stagger
+- Input bar: glassmorphism with gradient focus ring,
+  send button with glow, mic icon placeholder
+- Quick action chips: "Clean Desktop", "Find a File",
+  "Show Duplicates", "Storage Report", 
+  "Organize Downloads"
+- Typing indicator: three animated dots
+
+Command routing via Electron IPC:
+- "clean desktop" → scan + open ApprovalModal
+- "find [x]" / "where is [x]" → AI search + results
+- "show duplicates" → open Duplicates page
+- "organize [folder]" → scan that folder
+- "storage report" → Analytics summary card in chat
+- Unrecognised command → switch to MODE 2
+
+MODE 2 — Ask AI Mode:
+- "Ask AI" toggle button in top bar with gradient glow
+- Slides in a 400px right panel (Framer Motion)
+- Panel contains iframe of watsonx Orchestrate embed:
+  src: hostURL from orchestrate config
+  agentId: "29847e54-fe41-4afe-8f00-1f1249f5e06a"
+- Panel header: "SmartDesk AI Assistant", close button
+- User can ask: "what can SmartDesk do?", 
+  "how do I organise files?", "explain my storage"
+- Smooth slide animation between modes
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+AI FILE SEARCH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Build src/backend/search.js:
+- Accept natural language query string
+- Parse locally (no AI call needed):
+  * Remove stop words: find, where, is, my, the, a
+  * Detect file type hint from keywords
+  * Remaining words = search keywords
+- Search Supabase: ILIKE fuzzy match on filename
+  for each keyword, filter by extension if hint found
+- If under 3 results: live filesystem search 
+  using glob in watched folders
+- Rank: exact match first, partial match, 
+  then by created_at DESC
+- Return: { filename, filepath, size_bytes, 
+  extension, updated_at, match_score }
+- Record and return search duration
+
+Build src/renderer/components/SearchResults.jsx:
+- Glassmorphism result cards
+- File type icon colored by extension
+- Filename with matched keyword highlighted 
+  in accent color
+- Full path muted, size + last modified date
+- "Open Location" → Electron shell.showItemInFolder
+- "Open File" → Electron shell.openPath
+- Cards stagger animate in with Framer Motion
+- Empty state: animated icon + 
+  "No files found. Try different keywords."
+- Stats bar: "Found X results in 0.Xs"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LEARNING ENGINE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Build src/backend/learning.js:
+- On user approval: record in user_preferences
+  (keyword from filename, extension, 
+  ai_suggested_folder, user_confirmed_folder,
+  increment times_confirmed)
+- On user override: record override as preferred
+- After 3+ confirmations: set is_learned_rule = true
+- On classify: check learned rules first, 
+  skip watsonx call if match found, return 
+  confidence 1.0
+- Learning decay: 2 overrides of learned rule 
+  demotes it back to suggestion
+
+Also in Settings page — Learned Rules section:
+- Table: pattern, extension, destination folder,
+  times confirmed, enable/disable toggle
+- "Clear All Rules" with confirmation dialog
+- Animated row delete slide-out
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DUPLICATE DETECTOR
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Build src/backend/duplicates.js:
+- Scan watched folders, compute MD5 hash 
+  per file using crypto module
+- Exact duplicates: same hash grouped together
+- Near duplicates: Levenshtein distance 
+  on filenames (Resume.pdf, Resume(1).pdf, 
+  Resume_Final.pdf)
+- Store groups in Supabase duplicate_groups 
+  with JSONB arrays
+- Recommend keep: newest or largest file
+- Calculate total storage recoverable
+
+Build src/renderer/pages/Duplicates.jsx:
+- Glassmorphism group cards
+- Each card: all duplicate versions listed with 
+  size, date, path
+- Recommended keep highlighted with green badge
+- Per group actions: 
+  "Keep Recommended + Delete Rest" 
+  (Electron shell.trashItem — never permanent delete),
+  "Keep All", "Review Manually"
+- Running total top bar: 
+  "X groups · Y MB recoverable" with glow
+- Confirmation dialog before any deletion:
+  "This moves X files to Recycle Bin. 
+   You can restore them."
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ANALYTICS PAGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Build src/renderer/pages/Analytics.jsx:
+Charts using recharts, all animated on load:
+- Files organized per day: BarChart 
+  gradient fill, last 30 days
+- Storage saved over time: AreaChart 
+  gradient fill, glowing line
+- File category breakdown: DonutChart 
+  with custom legend, gradient colors per category
+- Top 5 most active folders: 
+  horizontal BarChart
+
+Summary stat cards (large, glowing):
+- Total Files Organized All Time
+- Total Storage Saved
+- Most Active Day
+- Average Files Per Day
+
+Activity Log:
+- Filterable by date range and action type
+- Rows: action icon colored, filename, 
+  from path → to path, file size, timestamp
+- 25 rows per page with pagination
+- Export as CSV button
+
+Data from Supabase activity_log and sessions,
+refresh every 30 seconds
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SETTINGS PAGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Build src/renderer/pages/Settings.jsx:
+- Add / remove watched folders with folder picker
+- Toggle auto-classify on file detection
+- Toggle desktop notifications
+- Supabase connection status indicator 
+  (green dot = connected, red = error)
+- Learned Rules table (from learning module)
+- Clear all data button with confirmation
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ELECTRON MAIN PROCESS + FINAL WIRING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Build src/main/index.js with full IPC map:
+
+- app ready:
+  * Test Supabase connection
+  * Create hidden orchestrate window
+  * Wait 5 seconds for agent load
+  * Start file watcher
+  * Create main BrowserWindow
+  * Show splash screen during init
+
+- "file:detected" → 
+  classifyFile(metadata) → 
+  update Supabase → 
+  send desktop notification 
+  "X new files detected — Review now" →
+  notify renderer to refresh pending list
+
+- "cmd:clean-desktop" → 
+  scan watched folders → 
+  classify all pending files → 
+  send classified list to renderer → 
+  open ApprovalModal
+
+- "cmd:approve-files" (array of 
+  {id, filepath, destination}) → 
+  fs.rename each file → 
+  create destination folders if not exist →
+  logActivity for each → 
+  updateSession stats → 
+  send completion summary to renderer
+
+- "cmd:search" (query string) → 
+  search.query(q) → return results
+
+- "cmd:scan-duplicates" → 
+  duplicates.scan() → return groups
+
+- "cmd:trash-files" (array of paths) → 
+  shell.trashItem() each → 
+  logActivity deleted → 
+  update Supabase duplicate_groups resolved
+
+- "app:get-watched-folders" → 
+  return from electron-store
+
+- "app:set-watched-folders" (folders array) → 
+  save to electron-store → 
+  restart watcher with new folders
+
+System tray:
+- Icon with right click menu: 
+  Open SmartDesk, Pause Watching, Quit
+- Badge count showing pending files
+
+Auto launch:
+- electron-auto-launch on system startup
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DELIVER ALL FILES COMPLETELY:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+src/main/index.js
+src/main/orchestrateWindow.js
+src/orchestrate/index.html
+src/db/supabase.js
+src/db/schema.sql
+src/db/queries.js
+src/watcher/index.js
+src/backend/watsonx.js
+src/backend/search.js
+src/backend/duplicates.js
+src/backend/learning.js
+src/renderer/App.jsx
+src/renderer/pages/Dashboard.jsx
+src/renderer/pages/Chat.jsx
+src/renderer/pages/Analytics.jsx
+src/renderer/pages/Duplicates.jsx
+src/renderer/pages/Settings.jsx
+src/renderer/components/ApprovalModal.jsx
+src/renderer/components/SearchResults.jsx
+src/renderer/components/Sidebar.jsx
+package.json
+.env.example

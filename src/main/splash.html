@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SmartDesk AI</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      width: 100%; height: 100%;
+      background: #0F0F1A;
+      font-family: 'Inter', system-ui, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      overflow: hidden;
+      user-select: none;
+      /* Allow dragging the entire splash to move the window */
+      -webkit-app-region: drag;
+    }
+
+    .splash {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      gap: 28px;
+    }
+
+    /* Logo */
+    .logo {
+      width: 64px; height: 64px;
+      border-radius: 18px;
+      background: linear-gradient(135deg, #4F46E5, #7C3AED);
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 0 32px rgba(79,70,229,0.5);
+    }
+    .logo svg { width: 32px; height: 32px; color: #fff; }
+
+    /* Title */
+    .title {
+      font-size: 22px; font-weight: 700; letter-spacing: -0.3px;
+      background: linear-gradient(135deg, #818CF8, #A78BFA);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    /* Status message */
+    .status {
+      font-size: 13px; color: #8B8BAD;
+      min-height: 20px; text-align: center;
+      transition: opacity 0.3s;
+    }
+
+    /* Animated dots loader */
+    .loader {
+      display: flex; gap: 7px; align-items: center;
+    }
+    .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #4F46E5;
+      animation: bounce 1.2s infinite ease-in-out;
+    }
+    .dot:nth-child(1) { animation-delay: 0s;    background: #4F46E5; }
+    .dot:nth-child(2) { animation-delay: 0.2s;  background: #6366F1; }
+    .dot:nth-child(3) { animation-delay: 0.4s;  background: #7C3AED; }
+
+    @keyframes bounce {
+      0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+      40%           { transform: scale(1.0); opacity: 1.0; }
+    }
+
+    /* Progress bar */
+    .progress-track {
+      width: 220px; height: 3px;
+      border-radius: 999px;
+      background: rgba(79,70,229,0.15);
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%; width: 0%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, #4F46E5, #7C3AED);
+      transition: width 0.4s ease;
+      box-shadow: 0 0 8px rgba(79,70,229,0.6);
+    }
+  </style>
+</head>
+<body>
+  <div class="splash">
+    <!-- Logo -->
+    <div class="logo">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+      </svg>
+    </div>
+
+    <!-- App name -->
+    <p class="title">SmartDesk AI</p>
+
+    <!-- Bouncing dots -->
+    <div class="loader">
+      <div class="dot"></div>
+      <div class="dot"></div>
+      <div class="dot"></div>
+    </div>
+
+    <!-- Status text updated by JS -->
+    <p class="status" id="status-text">Connecting to SmartDesk AI…</p>
+
+    <!-- Progress bar -->
+    <div class="progress-track">
+      <div class="progress-fill" id="progress-fill"></div>
+    </div>
+  </div>
+
+  <script>
+    const statusEl  = document.getElementById('status-text');
+    const progressEl = document.getElementById('progress-fill');
+
+    const STAGES = [
+      { pct: 10, msg: 'Connecting to SmartDesk AI…'        },
+      { pct: 30, msg: 'Loading watsonx Orchestrate…'        },
+      { pct: 55, msg: 'Initialising AI agent…'              },
+      { pct: 75, msg: 'Warming up classification engine…'  },
+      { pct: 90, msg: 'Almost ready…'                       },
+      { pct: 100, msg: 'Ready!'                             },
+    ];
+
+    const TOTAL_MS  = 5000;  // must match AGENT_WARM_UP_MS in main process
+    const stepMs    = TOTAL_MS / STAGES.length;
+
+    STAGES.forEach(({ pct, msg }, i) => {
+      setTimeout(() => {
+        if (statusEl)  statusEl.textContent  = msg;
+        if (progressEl) progressEl.style.width = pct + '%';
+      }, i * stepMs);
+    });
+  </script>
+</body>
+</html>
