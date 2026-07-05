@@ -1057,7 +1057,7 @@ export default function Chat() {
           plan={approvalPlan}
           mode={planModalMode}
           onClose={() => setPlanModalOpen(false)}
-          onCancel={() => { setPlanModalOpen(false); clearApprovalPlan(); }}
+          onCancel={() => setPlanModalOpen(false)}
           onApproved={(message) => {
             setPlanModalOpen(false);
             clearApprovalPlan();

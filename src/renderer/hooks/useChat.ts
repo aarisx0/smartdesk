@@ -219,19 +219,14 @@ export function useChat() {
   }, []);
 
   // Keep approvalPlanRef in sync whenever we set plan state.
-  // Also open the modal immediately so the user sees the plan without needing to click.
+  // We do NOT auto-open the modal — the user clicks "Details" or "Approve & Organise"
+  // from the action card. This keeps those buttons visible and clickable at all times,
+  // even while the modal happens to be open in the background.
   const setPlan = useCallback((plan: ApprovalPlan | null) => {
     approvalPlanRef.current = plan;
     setApprovalPlan(plan);
-    if (plan) {
-      // A real plan is ready — clear any stale pending operation so it
-      // never interferes with the next request.
-      pendingOperationRef.current = null;
-      // Use setTimeout so Chat.tsx has rendered and registered openPlanModalRef
-      setTimeout(() => openPlanModalRef.current?.(), 0);
-    } else {
-      // Plan cleared (cancelled or approved) — also wipe pending so the next
-      // request starts with a clean slate.
+    if (!plan) {
+      // Plan cleared after successful approval — wipe any stale pending operation.
       pendingOperationRef.current = null;
     }
   }, []);
@@ -258,6 +253,7 @@ export function useChat() {
       if (planData.threadId) threadIdRef.current = planData.threadId;
       if (planData.intent?.approvalPlan) {
         setPlan(planData.intent.approvalPlan);
+        pendingOperationRef.current = null;
         const meta = getPlanActionMeta(planData.intent.type || planData.intent.approvalPlan.type);
         push('assistant', { type: 'action', action: {
           label:     planData.intent.approvalPlan.title,
@@ -389,8 +385,9 @@ export function useChat() {
         const data = await res.json() as AgentResponse;
 
         if (data.intent?.approvalPlan) {
-          // Plan found — setPlan clears pendingOperationRef automatically
+          // Plan found — clear any stale pending operation and show the action card.
           setPlan(data.intent.approvalPlan);
+          pendingOperationRef.current = null;
           push('assistant', { type: 'text', text: data.reply || `I found files to organise in **${folderLabel}**.` });
           push('assistant', { type: 'action', action: {
             label:     data.intent.approvalPlan.title,
@@ -538,10 +535,11 @@ export function useChat() {
     if (!text || typing) return;
     const isProceed = isProceedConfirmation(text);
 
-    // ── Case 1: plan exists — open the modal instead of querying the agent ──
+    // ── Case 1: plan exists + user said "yes/proceed" — open approve modal ──
     if (isProceed && approvalPlanRef.current) {
       push('user', { type: 'text', text });
-      openPlanModalRef.current?.();
+      // Open in approve mode so the user can execute immediately
+      if (openPlanModalRef.current) openPlanModalRef.current();
       return;
     }
 
@@ -592,6 +590,7 @@ export function useChat() {
           if (planData.threadId) threadIdRef.current = planData.threadId;
           if (planData.intent?.approvalPlan) {
             setPlan(planData.intent.approvalPlan);
+            pendingOperationRef.current = null;
             const meta = getPlanActionMeta(planData.intent.type || planData.intent.approvalPlan.type);
             push('assistant', { type: 'action', action: {
               label:     planData.intent.approvalPlan.title,
@@ -844,9 +843,9 @@ export function useChat() {
           }
           case 'scan_structure': {
             // If the backend already built a real scan plan — use it directly.
-            // setPlan() now also clears pendingOperationRef.
             if (intent?.approvalPlan) {
               setPlan(intent.approvalPlan);
+              pendingOperationRef.current = null;
               push('assistant', { type: 'action', action: {
                 label:     intent.approvalPlan.title,
                 icon:      'Sparkles',
@@ -896,6 +895,7 @@ export function useChat() {
                 const planData = await planRes.json() as AgentResponse;
                 if (planData.intent?.approvalPlan) {
                   setPlan(planData.intent.approvalPlan);
+                  pendingOperationRef.current = null;
                   push('assistant', { type: 'action', action: {
                     label:     planData.intent.approvalPlan.title,
                     icon:      'FolderOpen',

@@ -1,8 +1,8 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { Outlet, NavLink, useLocation } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
-  LayoutDashboard, CheckCircle, Activity, Settings,
+  LayoutDashboard, Activity, Settings,
   MessageSquare, BarChart2, Copy,
   Minus, Square, X, Zap, ChevronLeft, ChevronRight,
 } from 'lucide-react';
@@ -16,7 +16,6 @@ const NAV_ITEMS: Array<{
   badge?: boolean;
 }> = [
   { to: '/',           icon: LayoutDashboard, label: 'Dashboard'      },
-  { to: '/approvals',  icon: CheckCircle,     label: 'Approvals',  badge: true },
   { to: '/chat',       icon: MessageSquare,   label: 'Chat'            },
   { to: '/analytics',  icon: BarChart2,       label: 'Analytics'       },
   { to: '/duplicates', icon: Copy,            label: 'Duplicates'      },
@@ -41,24 +40,6 @@ const labelVariants = {
 export default function Layout() {
   const location = useLocation();
   const [collapsed, setCollapsed] = useState(false);
-  const [pendingCount, setPendingCount] = useState(0);
-
-  // Fetch real pending count from backend, refresh every 30s
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const res  = await fetch('http://localhost:3001/api/activity?status=pending&limit=1');
-        const data = await res.json() as any[];
-        // The backend returns the actual rows — get count from stats endpoint instead
-        const statsRes  = await fetch('http://localhost:3001/api/stats');
-        const statsData = await statsRes.json();
-        setPendingCount(statsData.approvals ?? 0);
-      } catch { /* silently ignore */ }
-    };
-    load();
-    const iv = setInterval(load, 30_000);
-    return () => clearInterval(iv);
-  }, []);
 
   const handleWindow = (action: 'minimize' | 'maximize' | 'close') =>
     window.electronAPI?.window[action]();
@@ -111,7 +92,7 @@ export default function Layout() {
 
         {/* Navigation */}
         <nav className="flex flex-col gap-0.5 flex-1 px-2 overflow-y-auto overflow-x-hidden">
-          {NAV_ITEMS.map(({ to, icon: Icon, label, badge }) => {
+          {NAV_ITEMS.map(({ to, icon: Icon, label }) => {
             const isActive =
               to === '/'
                 ? location.pathname === '/'
@@ -157,28 +138,6 @@ export default function Layout() {
                     </motion.span>
                   )}
                 </AnimatePresence>
-
-                {/* Badge (approvals) */}
-                {badge && !collapsed && pendingCount > 0 && (
-                  <span
-                    className="ml-auto text-xs font-semibold px-1.5 py-0.5 rounded-full"
-                    style={{
-                      background: 'rgba(79,70,229,.2)',
-                      color: '#818CF8',
-                      border: '1px solid rgba(79,70,229,.3)',
-                    }}
-                  >
-                    {pendingCount > 99 ? '99+' : pendingCount}
-                  </span>
-                )}
-
-                {/* Collapsed tooltip dot for badge */}
-                {badge && collapsed && pendingCount > 0 && (
-                  <span
-                    className="absolute top-1.5 right-1.5 w-1.5 h-1.5 rounded-full"
-                    style={{ background: '#4F46E5', boxShadow: '0 0 4px #4F46E5' }}
-                  />
-                )}
               </NavLink>
             );
           })}
