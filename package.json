@@ -12,7 +12,8 @@
     "build": "npm run build:renderer && npm run build:main",
     "build:renderer": "vite build --config vite.config.ts",
     "build:main": "tsc -p tsconfig.main.json && npm run copy:runtime",
-    "copy:runtime": "xcopy /E /I /Y src\\watcher dist\\watcher & xcopy /E /I /Y src\\db dist\\db & xcopy /E /I /Y src\\backend dist\\backend & copy /Y src\\main\\splash.html dist\\main\\splash.html",
+    "copy:runtime": "if not exist dist\\main md dist\\main & xcopy /E /I /Y src\\watcher dist\\watcher & xcopy /E /I /Y src\\db dist\\db & xcopy /E /I /Y src\\backend dist\\backend & copy /Y src\\main\\splash.html dist\\main\\splash.html",
+    "copy:splash": "if not exist dist\\main md dist\\main & copy /Y src\\main\\splash.html dist\\main\\splash.html",
     "dist": "npm run build && electron-builder",
     "lint": "eslint src --ext .ts,.tsx,.js"
   },

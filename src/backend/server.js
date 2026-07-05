@@ -14,6 +14,7 @@ const searchRoutes      = require('./routes/search');
 const duplicatesRoutes  = require('./routes/duplicates');
 const learningRoutes    = require('./routes/learning');
 const chatRoutes        = require('./routes/chat');
+const chatSessionsRoutes = require('./routes/chatSessions');
 const analyticsRoutes   = require('./routes/analytics');
 
 const app = express();
@@ -40,8 +41,9 @@ app.use('/api/stats',      statsRoutes);
 app.use('/api/search',     searchRoutes);
 app.use('/api/duplicates', duplicatesRoutes);
 app.use('/api/learning',   learningRoutes);
-app.use('/api/chat',       chatRoutes);
-app.use('/api/analytics',  analyticsRoutes);
+app.use('/api/chat',      chatRoutes);
+app.use('/api/sessions', chatSessionsRoutes);
+app.use('/api/analytics', analyticsRoutes);
 
 // Health
 app.get('/health', (_req, res) => res.json({ status: 'ok', ts: Date.now() }));

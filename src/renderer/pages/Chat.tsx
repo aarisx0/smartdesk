@@ -6,6 +6,7 @@ import {
   FileText, FileImage, FileVideo, FileAudio, FileCode,
   FileSpreadsheet, FileArchive, File,
   MessageSquare, Brain, CheckCircle2, Sparkles, RefreshCw,
+  History, Plus, Trash2, Clock, Save, ChevronLeft,
 } from 'lucide-react';
 import { type ChatMessage } from '../hooks/useChat';
 import { useChatContext } from '../context/ChatContext';
@@ -902,6 +903,205 @@ function InputBar({ onSend, disabled }: InputBarProps) {
   );
 }
 
+// ─── chat history panel ───────────────────────────────────────────────────────
+
+interface SessionSummary {
+  id: string;
+  title: string;
+  message_count: number;
+  updated_at: string;
+}
+
+interface ChatHistoryPanelProps {
+  onLoad:   (id: string) => void;
+  onDelete: (id: string) => void;
+  onNew:    () => void;
+  onSave:   () => Promise<string | null>;
+  onClose:  () => void;
+  currentId: string | null;
+  hasMessages: boolean;
+}
+
+function ChatHistoryPanel({ onLoad, onDelete, onNew, onSave, onClose, currentId, hasMessages }: ChatHistoryPanelProps) {
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [loading, setLoading]   = useState(true);
+  const [saving, setSaving]     = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saveOk, setSaveOk]     = useState(false);
+
+  const fetchSessions = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res  = await fetch('http://localhost:3001/api/sessions');
+      if (!res.ok) throw new Error(`Server error: ${res.status}`);
+      const data = await res.json() as SessionSummary[];
+      setSessions(Array.isArray(data) ? data : []);
+    } catch (err) {
+      console.error('[ChatHistoryPanel] fetchSessions:', err);
+      setSessions([]);
+    }
+    finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => { fetchSessions(); }, [fetchSessions]);
+
+  const handleSave = async () => {
+    setSaving(true);
+    setSaveError(null);
+    setSaveOk(false);
+    try {
+      const id = await onSave();
+      if (id) {
+        setSaveOk(true);
+        setTimeout(() => setSaveOk(false), 2000);
+        await fetchSessions();
+      } else {
+        setSaveError('Save failed — check that the database schema has been applied.');
+      }
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Save failed');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDelete = async (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    await onDelete(id);
+    setSessions((s) => s.filter((x) => x.id !== id));
+  };
+
+  function relativeTime(iso: string): string {
+    const diff = Date.now() - new Date(iso).getTime();
+    const mins = Math.floor(diff / 60_000);
+    if (mins < 1)  return 'just now';
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24)  return `${hrs}h ago`;
+    return `${Math.floor(hrs / 24)}d ago`;
+  }
+
+  return (
+    <motion.div
+      initial={{ x: -280, opacity: 0 }}
+      animate={{ x: 0, opacity: 1 }}
+      exit={{ x: -280, opacity: 0 }}
+      transition={{ type: 'spring', stiffness: 340, damping: 36 }}
+      className="flex flex-col shrink-0 border-r overflow-hidden"
+      style={{
+        width: 268,
+        background: 'rgba(12,12,28,0.97)',
+        borderColor: 'rgba(255,255,255,0.07)',
+        backdropFilter: 'blur(20px)',
+      }}
+    >
+      {/* Header */}
+      <div className="flex items-center justify-between px-4 py-3.5 border-b shrink-0"
+        style={{ borderColor: 'rgba(255,255,255,0.07)' }}>
+        <div className="flex items-center gap-2">
+          <History size={15} className="text-indigo-400" />
+          <span className="text-sm font-semibold text-white">Chat History</span>
+        </div>
+        <motion.button whileHover={{ scale: 1.1 }} whileTap={{ scale: 0.9 }}
+          onClick={onClose}
+          className="w-6 h-6 rounded-lg flex items-center justify-center"
+          style={{ background: 'rgba(255,255,255,0.05)', color: '#8B8BAD' }}
+        >
+          <ChevronLeft size={13} />
+        </motion.button>
+      </div>
+
+      {/* Action buttons */}
+      <div className="px-3 py-2.5 flex gap-2 border-b shrink-0"
+        style={{ borderColor: 'rgba(255,255,255,0.06)' }}>
+        <motion.button whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}
+          onClick={onNew}
+          className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-xl text-xs font-semibold"
+          style={{ background: 'rgba(79,70,229,0.15)', color: '#818CF8', border: '1px solid rgba(79,70,229,0.25)' }}
+        >
+          <Plus size={12} /> New Chat
+        </motion.button>
+        {hasMessages && (
+          <motion.button whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}
+            onClick={handleSave}
+            disabled={saving}
+            className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-xl text-xs font-semibold"
+            style={{
+              background: saveOk ? 'rgba(52,211,153,0.2)' : 'rgba(52,211,153,0.1)',
+              color: saveOk ? '#6EE7B7' : '#34D399',
+              border: `1px solid ${saveOk ? 'rgba(52,211,153,0.4)' : 'rgba(52,211,153,0.2)'}`,
+            }}
+          >
+            <Save size={12} /> {saving ? 'Saving…' : saveOk ? 'Saved ✓' : 'Save'}
+          </motion.button>
+        )}
+      </div>
+      {/* Save error */}
+      {saveError && (
+        <div className="px-3 py-2 text-[10px] shrink-0"
+          style={{ color: '#FCA5A5', background: 'rgba(239,68,68,0.08)', borderBottom: '1px solid rgba(239,68,68,0.12)' }}>
+          ⚠ {saveError}
+        </div>
+      )}
+
+      {/* Session list */}
+      <div className="flex-1 overflow-y-auto py-2 px-2">
+        {loading ? (
+          <div className="flex items-center justify-center py-10">
+            <RefreshCw size={16} className="animate-spin text-indigo-400" />
+          </div>
+        ) : sessions.length === 0 ? (
+          <div className="text-center py-10 px-4">
+            <Clock size={24} className="mx-auto mb-2" style={{ color: '#555575' }} />
+            <p className="text-xs" style={{ color: '#555575' }}>No saved chats yet.</p>
+            <p className="text-xs mt-1" style={{ color: '#555575' }}>Click Save to keep this conversation.</p>
+          </div>
+        ) : (
+          <div className="space-y-1">
+            {sessions.map((s) => (
+              <motion.div
+                key={s.id}
+                whileHover={{ backgroundColor: 'rgba(79,70,229,0.1)' }}
+                onClick={() => onLoad(s.id)}
+                className="group flex items-start justify-between gap-2 px-3 py-2.5 rounded-xl cursor-pointer transition-all"
+                style={{
+                  background: s.id === currentId ? 'rgba(79,70,229,0.16)' : 'transparent',
+                  border: s.id === currentId ? '1px solid rgba(79,70,229,0.28)' : '1px solid transparent',
+                }}
+              >
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs font-medium truncate leading-snug"
+                    style={{ color: s.id === currentId ? '#C4C4FF' : '#C4C4E8' }}>
+                    {s.title}
+                  </p>
+                  <div className="flex items-center gap-2 mt-0.5">
+                    <span className="text-[10px]" style={{ color: '#555575' }}>
+                      {s.message_count} msg{s.message_count !== 1 ? 's' : ''}
+                    </span>
+                    <span className="text-[10px]" style={{ color: '#555575' }}>·</span>
+                    <span className="text-[10px]" style={{ color: '#555575' }}>
+                      {relativeTime(s.updated_at)}
+                    </span>
+                  </div>
+                </div>
+                <motion.button
+                  whileHover={{ scale: 1.15 }}
+                  whileTap={{ scale: 0.9 }}
+                  onClick={(e) => handleDelete(s.id, e)}
+                  className="opacity-0 group-hover:opacity-100 shrink-0 w-6 h-6 rounded-lg flex items-center justify-center transition-opacity"
+                  style={{ background: 'rgba(239,68,68,0.15)', color: '#F87171' }}
+                >
+                  <Trash2 size={11} />
+                </motion.button>
+              </motion.div>
+            ))}
+          </div>
+        )}
+      </div>
+    </motion.div>
+  );
+}
+
 // ─── MAIN PAGE COMPONENT ──────────────────────────────────────────────────────
 
 export default function Chat() {
@@ -912,12 +1112,14 @@ export default function Chat() {
     openPlanModalRef,
     sendMessage, sendQuickAction,
     pushMessage,
+    saveSession, loadSession, newSession, deleteSession,
+    currentSessionId,
   } = useChatContext();
 
-  const [modalOpen, setModalOpen] = useState(false);
+  const [modalOpen, setModalOpen]         = useState(false);
   const [planModalOpen, setPlanModalOpen] = useState(false);
-  // 'approve' = normal flow; 'details' = read-only details view
   const [planModalMode, setPlanModalMode] = useState<'approve' | 'details'>('approve');
+  const [historyOpen, setHistoryOpen]     = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -928,8 +1130,6 @@ export default function Chat() {
     if (approvalFiles && approvalFiles.length > 0) setModalOpen(true);
   }, [approvalFiles]);
 
-  // Register the open-modal callback so the hook can open it directly.
-  // This runs once on mount and stays stable — no stale closure issues.
   useEffect(() => {
     openPlanModalRef.current = () => {
       setPlanModalMode('approve');
@@ -938,7 +1138,21 @@ export default function Chat() {
     return () => { openPlanModalRef.current = null; };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Opens modal in approve mode (standard)
+  // Auto-save current session 5 seconds after the last message (debounced)
+  const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (messages.length === 0) return;
+    if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
+    autoSaveTimerRef.current = setTimeout(() => {
+      saveSession().catch((err) => {
+        console.warn('[Chat] auto-save failed silently:', err?.message ?? err);
+      });
+    }, 5_000);
+    return () => {
+      if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
+    };
+  }, [messages, saveSession]);
+
   const handleApprovalCta = useCallback(() => {
     if (approvalPlan) {
       setPlanModalMode('approve');
@@ -948,7 +1162,6 @@ export default function Chat() {
     }
   }, [approvalPlan]);
 
-  // Opens modal in details/read-only mode — user can inspect plan then decide
   const handleDetailsCta = useCallback(() => {
     if (approvalPlan) {
       setPlanModalMode('details');
@@ -956,92 +1169,147 @@ export default function Chat() {
     }
   }, [approvalPlan]);
 
+  const handleLoadSession = useCallback(async (id: string) => {
+    await loadSession(id);
+    setHistoryOpen(false);
+  }, [loadSession]);
+
   return (
     <motion.div
       variants={pageVariants}
       initial="hidden"
       animate="visible"
       exit="exit"
-      className="flex flex-col h-full overflow-hidden"
+      className="flex h-full overflow-hidden"
       style={{ minHeight: 0 }}
     >
-      {/* ── Header ──────────────────────────────────────────────────────── */}
-      <div className="flex items-center justify-between px-1 pb-4 shrink-0">
-        <div>
-          <h1 className="text-xl font-bold text-white flex items-center gap-2">
-            <MessageSquare size={18} className="text-indigo-400" />
-            Chat
-          </h1>
-          <p className="text-xs mt-0.5" style={{ color: '#8B8BAD' }}>
-            Ask anything — file commands, search, duplicates, storage
-          </p>
-        </div>
-      </div>
+      {/* ── History panel (slides in from left) ─────────────────────────── */}
+      <AnimatePresence>
+        {historyOpen && (
+          <ChatHistoryPanel
+            key="history"
+            onLoad={handleLoadSession}
+            onDelete={deleteSession}
+            onNew={() => { newSession(); setHistoryOpen(false); }}
+            onSave={saveSession}
+            onClose={() => setHistoryOpen(false)}
+            currentId={currentSessionId}
+            hasMessages={messages.length > 0}
+          />
+        )}
+      </AnimatePresence>
 
-      {/* ── Message area ────────────────────────────────────────────────── */}
-      <div className="flex-1 overflow-y-auto px-1 pb-2" style={{ minHeight: 0 }}>
-        {messages.length === 0 ? (
-          <EmptyState />
-        ) : (
-          <div className="flex flex-col">
-            <AnimatePresence initial={false}>
-              {messages.map((msg) => (
-                <MessageRenderer
-                  key={msg.id}
-                  msg={msg}
-                  onApprovalCta={handleApprovalCta}
-                  onDetailsCta={handleDetailsCta}
-                />
-              ))}
-            </AnimatePresence>
-            <AnimatePresence>
-              {typing && <TypingIndicator key="typing" />}
-            </AnimatePresence>
-            <div ref={bottomRef} />
+      {/* ── Main chat column ─────────────────────────────────────────────── */}
+      <div className="flex flex-col flex-1 overflow-hidden min-w-0">
+
+        {/* ── Header ────────────────────────────────────────────────────── */}
+        <div className="flex items-center justify-between px-1 pb-4 shrink-0">
+          <div className="flex items-center gap-3">
+            {/* History toggle */}
+            <motion.button
+              whileHover={{ scale: 1.08 }}
+              whileTap={{ scale: 0.93 }}
+              onClick={() => setHistoryOpen((v) => !v)}
+              className="w-8 h-8 rounded-xl flex items-center justify-center transition-all"
+              style={{
+                background: historyOpen ? 'rgba(79,70,229,0.2)' : 'rgba(255,255,255,0.05)',
+                border: historyOpen ? '1px solid rgba(79,70,229,0.35)' : '1px solid rgba(255,255,255,0.08)',
+                color: historyOpen ? '#818CF8' : '#8B8BAD',
+              }}
+              title="Chat History"
+            >
+              <History size={15} />
+            </motion.button>
+            <div>
+              <h1 className="text-xl font-bold text-white flex items-center gap-2">
+                <MessageSquare size={18} className="text-indigo-400" />
+                Chat
+              </h1>
+              <p className="text-xs mt-0.5" style={{ color: '#8B8BAD' }}>
+                Ask anything — file commands, search, duplicates, storage
+              </p>
+            </div>
+          </div>
+          {/* New chat button */}
+          {messages.length > 0 && (
+            <motion.button
+              whileHover={{ scale: 1.05 }}
+              whileTap={{ scale: 0.95 }}
+              onClick={() => newSession()}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium"
+              style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)', color: '#8B8BAD' }}
+            >
+              <Plus size={12} /> New Chat
+            </motion.button>
+          )}
+        </div>
+
+        {/* ── Message area ──────────────────────────────────────────────── */}
+        <div className="flex-1 overflow-y-auto px-1 pb-2" style={{ minHeight: 0 }}>
+          {messages.length === 0 ? (
+            <EmptyState />
+          ) : (
+            <div className="flex flex-col">
+              <AnimatePresence initial={false}>
+                {messages.map((msg) => (
+                  <MessageRenderer
+                    key={msg.id}
+                    msg={msg}
+                    onApprovalCta={handleApprovalCta}
+                    onDetailsCta={handleDetailsCta}
+                  />
+                ))}
+              </AnimatePresence>
+              <AnimatePresence>
+                {typing && <TypingIndicator key="typing" />}
+              </AnimatePresence>
+              <div ref={bottomRef} />
+            </div>
+          )}
+        </div>
+
+        {/* ── Quick actions ──────────────────────────────────────────────── */}
+        {messages.length === 0 && (
+          <div className="flex flex-wrap gap-2 pb-3 shrink-0">
+            {QUICK_ACTIONS.map(({ label, icon: Icon, cmd }, i) => (
+              <motion.button
+                key={label}
+                custom={i}
+                variants={chipVariants}
+                initial="hidden"
+                animate="visible"
+                whileHover={{ scale: 1.04, y: -1 }}
+                whileTap={{ scale: 0.96 }}
+                onClick={() => sendQuickAction(cmd)}
+                className="flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-medium transition-all"
+                style={{ background: 'rgba(79,70,229,.1)', border: '1px solid rgba(79,70,229,.22)', color: '#818CF8' }}
+                onMouseEnter={(e) => {
+                  (e.currentTarget as HTMLElement).style.background = 'rgba(79,70,229,.18)';
+                  (e.currentTarget as HTMLElement).style.boxShadow = '0 0 12px rgba(79,70,229,.25)';
+                }}
+                onMouseLeave={(e) => {
+                  (e.currentTarget as HTMLElement).style.background = 'rgba(79,70,229,.1)';
+                  (e.currentTarget as HTMLElement).style.boxShadow = 'none';
+                }}
+              >
+                <Icon size={13} />
+                {label}
+              </motion.button>
+            ))}
           </div>
         )}
-      </div>
 
-      {/* ── Quick actions ────────────────────────────────────────────────── */}
-      {messages.length === 0 && (
-        <div className="flex flex-wrap gap-2 pb-3 shrink-0">
-          {QUICK_ACTIONS.map(({ label, icon: Icon, cmd }, i) => (
-            <motion.button
-              key={label}
-              custom={i}
-              variants={chipVariants}
-              initial="hidden"
-              animate="visible"
-              whileHover={{ scale: 1.04, y: -1 }}
-              whileTap={{ scale: 0.96 }}
-              onClick={() => sendQuickAction(cmd)}
-              className="flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-medium transition-all"
-              style={{ background: 'rgba(79,70,229,.1)', border: '1px solid rgba(79,70,229,.22)', color: '#818CF8' }}
-              onMouseEnter={(e) => {
-                (e.currentTarget as HTMLElement).style.background = 'rgba(79,70,229,.18)';
-                (e.currentTarget as HTMLElement).style.boxShadow = '0 0 12px rgba(79,70,229,.25)';
-              }}
-              onMouseLeave={(e) => {
-                (e.currentTarget as HTMLElement).style.background = 'rgba(79,70,229,.1)';
-                (e.currentTarget as HTMLElement).style.boxShadow = 'none';
-              }}
-            >
-              <Icon size={13} />
-              {label}
-            </motion.button>
-          ))}
+        {/* ── Input bar ─────────────────────────────────────────────────── */}
+        <div className="shrink-0 pt-2">
+          <InputBar onSend={sendMessage} disabled={typing} />
+          <p className="text-center text-[10px] mt-2" style={{ color: '#555575' }}>
+            Try: "Clean Desktop" · "Find resume.pdf" · "Show duplicates" · "Storage report"
+          </p>
         </div>
-      )}
 
-      {/* ── Input bar ───────────────────────────────────────────────────── */}
-      <div className="shrink-0 pt-2">
-        <InputBar onSend={sendMessage} disabled={typing} />
-        <p className="text-center text-[10px] mt-2" style={{ color: '#555575' }}>
-          Try: "Clean Desktop" · "Find resume.pdf" · "Show duplicates" · "Storage report"
-        </p>
-      </div>
+      </div>{/* end main column */}
 
-      {/* ── Approval Modal ───────────────────────────────────────────────── */}
+      {/* ── Approval Modal ────────────────────────────────────────────────── */}
       <AnimatePresence>
         {modalOpen && approvalFiles && (
           <ApprovalModal

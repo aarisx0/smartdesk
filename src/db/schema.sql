@@ -82,6 +82,23 @@ CREATE TABLE IF NOT EXISTS duplicate_groups (
 );
 
 -- ─────────────────────────────────────────────────────────────
+--  6. chat_sessions
+--     Persists chat conversations so the user can resume them
+--     after closing the app.
+-- ─────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS chat_sessions (
+  id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  title        TEXT        NOT NULL DEFAULT 'New Chat',
+  messages     JSONB       NOT NULL DEFAULT '[]',
+  thread_id    TEXT,
+  message_count INT        DEFAULT 0,
+  created_at   TIMESTAMPTZ DEFAULT now(),
+  updated_at   TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated ON chat_sessions (updated_at DESC);
+
+-- ─────────────────────────────────────────────────────────────
 --  Trigger: keep files.updated_at current
 -- ─────────────────────────────────────────────────────────────
 CREATE OR REPLACE FUNCTION update_updated_at()

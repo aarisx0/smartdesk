@@ -529,7 +529,7 @@ export function useChat() {
     handleScanStructure,
   ]);
 
-  // ── Main send — IBM agent first, local fallback ONLY when agent fails ────────────────────
+  // ── Main send — IBM agent ALWAYS called first ─────────────────────────────
   const sendMessage = useCallback(async (input: string) => {
     const text = input.trim();
     if (!text || typing) return;
@@ -538,286 +538,167 @@ export function useChat() {
     // ── Case 1: plan exists + user said "yes/proceed" — open approve modal ──
     if (isProceed && approvalPlanRef.current) {
       push('user', { type: 'text', text });
-      // Open in approve mode so the user can execute immediately
       if (openPlanModalRef.current) openPlanModalRef.current();
       return;
     }
 
-    // ── Case 2: yes + pending operation stored from last agent reply ─────────
+    // ── Case 2: pending operation + confirmation — build plan directly ────────
     if (isProceed && pendingOperationRef.current) {
       const pending = pendingOperationRef.current;
       pendingOperationRef.current = null;
       push('user', { type: 'text', text });
 
       if (pending.type === 'organize') {
-        const target = pending.source || 'watched folders';
-        push('assistant', { type: 'text', text: `Preparing an organisation plan for **${target}**…` });
-        await handleScanStructure(target);
+        await handleScanStructure(pending.source || 'Desktop');
         return;
       }
 
       await withTyping(async () => {
         const { type, source, destination, specificFile } = pending;
+        // Build a natural language request to send to the backend plan-builder
+        const buildMessage = type === 'delete'
+          ? (specificFile ? `delete ${specificFile} from ${source}` : `delete files from ${source}`)
+          : (specificFile ? `move ${specificFile} from ${source} to ${destination}` : `move all files from ${source} to ${destination}`);
 
-        let buildMessage: string;
-        let loadingText: string;
-
-        if (type === 'delete') {
-          buildMessage = specificFile
-            ? `delete ${specificFile} from ${source}`
-            : `delete files from ${source}`;
-          loadingText = `Building delete plan for **${specificFile ?? 'files'}** in **${source}**…`;
-        } else {
-          // move
-          const fileLabel = specificFile ? `"${specificFile}"` : 'all files';
-          buildMessage = specificFile
-            ? `move ${specificFile} from ${source} to ${destination}`
-            : `move all files from ${source} to ${destination}`;
-          loadingText = `Building move plan: ${fileLabel} from **${source}** → **${destination}**…`;
-        }
-
-        push('assistant', { type: 'text', text: loadingText });
         try {
           const planRes = await fetch(`${API}/api/chat`, {
-            method:  'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body:    JSON.stringify({
-              message:  buildMessage,
-              threadId: threadIdRef.current,
-            }),
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message: buildMessage, threadId: threadIdRef.current }),
           });
           const planData = await planRes.json() as AgentResponse;
           if (planData.threadId) threadIdRef.current = planData.threadId;
+          if (planData.reply) push('assistant', { type: 'text', text: planData.reply });
           if (planData.intent?.approvalPlan) {
             setPlan(planData.intent.approvalPlan);
             pendingOperationRef.current = null;
             const meta = getPlanActionMeta(planData.intent.type || planData.intent.approvalPlan.type);
             push('assistant', { type: 'action', action: {
-              label:     planData.intent.approvalPlan.title,
-              icon:      meta.icon,
-              count:     planData.intent.approvalPlan.count,
-              detail:    planData.intent.approvalPlan.detail,
-              cta:       meta.cta,
-              ctaTarget: 'chat-approval-plan',
+              label: planData.intent.approvalPlan.title, icon: meta.icon,
+              count: planData.intent.approvalPlan.count, detail: planData.intent.approvalPlan.detail,
+              cta: meta.cta, ctaTarget: 'chat-approval-plan',
             }});
-          } else {
-            push('assistant', { type: 'text', text: planData.reply || `Ready. Please confirm by clicking Approve.` });
           }
         } catch (err) {
-          push('assistant', { type: 'error', text: `Plan failed: ${(err as Error).message}` });
+          push('assistant', { type: 'error', text: `Request failed: ${(err as Error).message}` });
         }
       });
       return;
     }
 
-    // ── Case 3: affirmative but nothing pending — ask what to do, no agent call ──
+    // ── Case 1b: isProceed but no plan/pending in memory ─────────────────────
+    // The IBM agent asked for confirmation in a previous message, but the plan
+    // was never stored as a SmartDesk ApprovalPlan (it was in the IBM thread only).
+    // Don't send raw "yes/proceed" to IBM — it will reply "I have no tool access".
+    // Instead, send it to the backend with the thread ID so IBM can re-derive the
+    // plan in the correct JSON format.
     if (isProceed) {
       push('user', { type: 'text', text });
-      push('assistant', { type: 'text', text: 'What would you like me to do? Try:\n• **"Organise my Desktop"**\n• **"Organise my Downloads"**\n• **"Move files from Desktop to Downloads"**\n• **"Find resume.pdf"**' });
+      await withTyping(async () => {
+        try {
+          // Re-send with explicit instruction to produce a structured plan
+          const res = await fetch(`${API}/api/chat`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              message: `${text} — please produce a SmartDesk action plan now (respond in the required JSON format with intent and approvalPlan)`,
+              threadId: threadIdRef.current,
+            }),
+          });
+          const data = await res.json() as AgentResponse;
+          if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+          if (data.threadId) threadIdRef.current = data.threadId;
+
+          if (data.reply) push('assistant', { type: 'text', text: data.reply });
+
+          if (data.intent?.approvalPlan) {
+            setPlan(data.intent.approvalPlan);
+            const meta = getPlanActionMeta(data.intent.type || data.intent.approvalPlan.type);
+            push('assistant', { type: 'action', action: {
+              label: data.intent.approvalPlan.title, icon: meta.icon,
+              count: data.intent.approvalPlan.count, detail: data.intent.approvalPlan.detail,
+              cta: meta.cta, ctaTarget: 'chat-approval-plan',
+            }});
+          }
+        } catch (err) {
+          push('assistant', { type: 'error', text: `Request failed: ${(err as Error).message}` });
+        }
+      });
       return;
     }
 
     push('user', { type: 'text', text });
 
-    // ── Fast path: scan/organize requests skip the IBM agent entirely ─────────
-    // We detect these locally and call handleScanStructure directly so the plan
-    // is always built correctly regardless of IBM agent availability or response format.
-    const SCAN_KEYWORDS = /\b(scan|organis[e]?|organiz[e]?|clean\s*up|reorganis[e]?|reorganiz[e]?|suggest.*organiz|give.*suggestion.*scan|suggestion.*folder|structure.*organiz)\b/i;
-    const FOLDER_NAMES = /\b(desktop|downloads?|documents?|pictures?|images?|videos?|music)\b/i;
-
-    if (SCAN_KEYWORDS.test(text) && FOLDER_NAMES.test(text)) {
-      const FMAP: Record<string, string> = {
-        desktop: 'Desktop', downloads: 'Downloads', download: 'Downloads',
-        documents: 'Documents', document: 'Documents',
-        pictures: 'Pictures', picture: 'Pictures',
-        images: 'Pictures', image: 'Pictures',
-        videos: 'Videos', music: 'Music',
-      };
-      let folderHint = '';
-      const tl = text.toLowerCase();
-      for (const [alias, canonical] of Object.entries(FMAP)) {
-        if (tl.includes(alias)) { folderHint = canonical; break; }
-      }
-      await handleScanStructure(folderHint || 'Desktop', text);
-      return;
-    }
-
-    // ── Fast path: "show structure / what's in / list contents" queries ───────
-    // These always read from disk directly — never from IBM thread memory.
-    const STRUCTURE_KEYWORDS = /\b(show\s+(me\s+)?(the\s+)?structure|what('?s|\s+is)\s+in|list\s+(the\s+)?(contents?|files?)|what\s+(files?|folders?)\s+are\s+in|show\s+(files?|folders?)\s+in|folder\s+structure|current\s+structure)\b/i;
-
-    if (STRUCTURE_KEYWORDS.test(text) && FOLDER_NAMES.test(text)) {
-      const FMAP: Record<string, string> = {
-        desktop: 'Desktop', downloads: 'Downloads', download: 'Downloads',
-        documents: 'Documents', document: 'Documents',
-        pictures: 'Pictures', picture: 'Pictures',
-        images: 'Pictures', image: 'Pictures',
-        videos: 'Videos', music: 'Music',
-      };
-      let folderHint = '';
-      const tl = text.toLowerCase();
-      for (const [alias, canonical] of Object.entries(FMAP)) {
-        if (tl.includes(alias)) { folderHint = canonical; break; }
-      }
-      if (folderHint) {
-        await handleShowStructure(folderHint);
-        return;
-      }
-    }
-
+    // ── Every message goes to IBM agent — no local fast-paths ─────────────────
     await withTyping(async () => {
-      await delay(220);
-
+      await delay(180);
       let agentSucceeded = false;
 
       try {
         const res = await fetch(`${API}/api/chat`, {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify({ message: text, threadId: threadIdRef.current }),
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: text, threadId: threadIdRef.current }),
         });
-
         const data = await res.json() as AgentResponse;
         if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
 
-        // Store thread ID for next turn — enables conversation continuity
         if (data.threadId) threadIdRef.current = data.threadId;
-
         agentSucceeded = true;
 
         const intent = data.intent;
         const intentType = intent?.type ?? 'chat';
 
-        // Show a safe reply. For operation intents, never show "already completed" style text
-        // from the LLM before approval/execution has actually happened.
+        // Always show the agent's reply text first — it comes from the real AI
         if (data.reply) {
-          const OPERATION_INTENTS = new Set([
-            'move_files', 'delete_file', 'create_folder', 'move_folder', 'organize_folder', 'scan_structure',
-          ]);
+          push('assistant', { type: 'text', text: data.reply });
+        }
 
-          if (OPERATION_INTENTS.has(intentType)) {
-            if (intent?.approvalPlan) {
-              // For scan_structure: show the agent's descriptive reply (it contains the breakdown)
-              // For other ops: show a shorter confirmation
-              if (intentType === 'scan_structure') {
-                push('assistant', { type: 'text', text: data.reply });
-              } else {
-                push('assistant', { type: 'text', text: 'I prepared an approval plan. Review it and approve to execute.' });
-              }
-            } else if (intentType === 'scan_structure' || intentType === 'organize_folder') {
-              push('assistant', { type: 'text', text: 'I will scan and prepare suggestions, then ask for approval before making any file or folder changes.' });
-            } else {
-              push('assistant', { type: 'text', text: 'I can prepare this as an approval plan and will wait for your permission before making changes.' });
-            }
-          } else {
-            push('assistant', { type: 'text', text: data.reply });
+        // Store pending context for move/delete so user can say "yes" to execute
+        if (data.reply && intent && !intent.approvalPlan) {
+          const src = intent.source?.trim() || intent.folderHint?.trim() || undefined;
+          const dst = intent.destination?.trim() || undefined;
+          const specificFile = extractRequestedFileHint(text) || intent.query?.trim() || undefined;
+
+          if (intentType === 'delete_file' && src) {
+            pendingOperationRef.current = { type: 'delete', source: src, specificFile };
+          } else if (intentType === 'move_files' && src && dst) {
+            pendingOperationRef.current = { type: 'move', source: src, destination: dst, specificFile };
+          } else if ((intentType === 'organize_folder' || intentType === 'scan_structure') && src) {
+            pendingOperationRef.current = { type: 'organize', source: src };
           }
+          // Even for 'chat' intent — if IBM reply sounds like it wants confirmation
+          // for a delete/move, store the pending so "yes/proceed" works next turn.
+          else if (intentType === 'chat' && data.reply) {
+            const replyLower = data.reply.toLowerCase();
+            const replyWantsDeleteConfirm =
+              /\b(confirm|proceed|yes.*delete|delete.*all|reply.*yes|type.*yes)\b/i.test(data.reply);
+            const replyWantsMoveConfirm =
+              /\b(confirm|proceed|yes.*move|move.*all|reply.*yes|type.*yes)\b/i.test(data.reply) &&
+              /\bmov(e|ing)\b/i.test(data.reply);
 
-          // Detect if the agent is describing a move or delete operation and store context
-          // so the user can say "yes" to trigger the plan
-          const replyLower = data.reply.toLowerCase();
-          const FOLDER_MAP: Record<string, string> = {
-            desktop: 'Desktop', downloads: 'Downloads', download: 'Downloads',
-            documents: 'Documents', document: 'Documents',
-            pictures: 'Pictures', picture: 'Pictures',
-            videos: 'Videos', music: 'Music',
-          };
-
-          // Extract specific filename from the original user message
-          const specificFile = extractRequestedFileHint(text) || data.intent?.query?.trim() || undefined;
-
-          const isDeleteReply = /\b(delete|remove|trash)\b/.test(replyLower);
-          const isMoveReply   = /\bmove\b/.test(replyLower) || /\bfrom\b.+\bto\b/.test(replyLower);
-
-          if (isDeleteReply && !isMoveReply) {
-            const fromMatch = replyLower.match(/from\s+(?:the\s+)?(?:your\s+)?([a-z]+)\s*(?:folder)?/i);
-            let src: string | null = null;
-            if (fromMatch) src = FOLDER_MAP[fromMatch[1].toLowerCase()] ?? null;
-            if (!src) {
-              // Try extracting from user message
-              const msgLower = text.toLowerCase();
-              for (const [alias, canonical] of Object.entries(FOLDER_MAP)) {
-                if (msgLower.includes(alias)) { src = canonical; break; }
-              }
-            }
-            if (src) {
+            if (replyWantsDeleteConfirm && src) {
               pendingOperationRef.current = { type: 'delete', source: src, specificFile };
-            }
-          } else if (isMoveReply) {
-            let src: string | null = null;
-            let dst: string | null = null;
-            const fromMatch = replyLower.match(/from\s+(?:the\s+)?(?:your\s+)?([a-z]+)\s*(?:folder)?/i);
-            const toMatch   = replyLower.match(/to\s+(?:the\s+)?(?:your\s+)?([a-z]+)\s*(?:folder)?/i);
-            if (fromMatch) src = FOLDER_MAP[fromMatch[1].toLowerCase()] ?? null;
-            if (toMatch)   dst = FOLDER_MAP[toMatch[1].toLowerCase()]   ?? null;
-            if (src && dst) {
+            } else if (replyWantsDeleteConfirm && !src) {
+              // IBM gave a plan in plain text but no structured source —
+              // store a delete pending with requestText so backend can re-derive
+              pendingOperationRef.current = { type: 'delete', source: 'watched', requestText: text };
+            } else if (replyWantsMoveConfirm && src && dst) {
               pendingOperationRef.current = { type: 'move', source: src, destination: dst, specificFile };
             }
-          } else if (/\b(organis|organiz|clean up|sort|reorganis|reorganiz)\b/.test(replyLower)) {
-            // IBM agent gave a rich suggestion reply — immediately scan and build
-            // a real plan rather than waiting for the user to say "proceed".
-            if (!data.intent?.approvalPlan) {
-              // Extract folder from user message first, then reply text
-              let src: string | null = null;
-              const msgLower = text.toLowerCase();
-              for (const [alias, canonical] of Object.entries(FOLDER_MAP)) {
-                if (msgLower.includes(alias)) { src = canonical; break; }
-              }
-              if (!src) {
-                const fromMatch = replyLower.match(/(?:in|from|for)\s+(?:the\s+)?(?:your\s+)?([a-z]+)\s*(?:folder)?/i);
-                if (fromMatch) src = FOLDER_MAP[fromMatch[1].toLowerCase()] ?? null;
-              }
-              const targetFolder = src || 'Desktop';
-              // Kick off the direct scan immediately (non-blocking — runs in parallel with reply display)
-              setTimeout(() => handleScanStructure(targetFolder, text), 0);
-            }
-          }
-
-          if (!pendingOperationRef.current && data.intent && !data.intent.approvalPlan) {
-            const src = data.intent.source?.trim() || data.intent.folderHint?.trim() || undefined;
-            const dst = data.intent.destination?.trim() || undefined;
-            const intentType = data.intent.type;
-            const hintedFile = specificFile || data.intent.query?.trim() || undefined;
-            if (intentType === 'delete_file' && src) {
-              pendingOperationRef.current = { type: 'delete', source: src, specificFile: hintedFile };
-            } else if (intentType === 'move_files' && src && dst) {
-              pendingOperationRef.current = { type: 'move', source: src, destination: dst, specificFile: hintedFile };
-            } else if (intentType === 'organize_folder' || intentType === 'scan_structure') {
-              // Extract folder from user message (most reliable) then fall back to intent
-              const msgFolder = (() => {
-                const tl = text.toLowerCase();
-                const FM: Record<string, string> = {
-                  desktop: 'Desktop', downloads: 'Downloads', download: 'Downloads',
-                  documents: 'Documents', document: 'Documents',
-                  pictures: 'Pictures', picture: 'Pictures',
-                  videos: 'Videos', music: 'Music',
-                };
-                for (const [alias, canonical] of Object.entries(FM)) {
-                  if (tl.includes(alias)) return canonical;
-                }
-                return null;
-              })();
-              const targetFolder = msgFolder || src || 'Desktop';
-              // Scan immediately — don't wait for "proceed"
-              setTimeout(() => handleScanStructure(targetFolder, text), 0);
-            }
           }
         }
 
-        // For these intents the agent reply is sufficient — don't run additional local actions
-        const REPLY_ONLY_INTENTS = new Set([
-          'chat', 'storage_report', 'count_folder_items',
-        ]);
-
-        if (REPLY_ONLY_INTENTS.has(intentType)) {
-          // Text reply already shown — done
-          return;
-        }
-
-        // For action intents, run the local handler to show structured UI
+        // Dispatch on intent type to trigger structured UI
         switch (intentType) {
+
+          case 'chat':
+          case 'storage_report':
+          case 'count_folder_items':
+          case 'find_duplicates':
+            // Reply already shown — no further action needed
+            break;
+
           case 'move_files':
           case 'delete_file':
+          case 'rename_file':
           case 'create_folder':
           case 'move_folder': {
             if (intent?.approvalPlan) {
@@ -825,144 +706,181 @@ export function useChat() {
               pendingOperationRef.current = null;
               const meta = getPlanActionMeta(intentType);
               push('assistant', { type: 'action', action: {
-                label:     intent.approvalPlan.title,
-                icon:      meta.icon,
-                count:     intent.approvalPlan.count,
-                detail:    intent.approvalPlan.detail,
-                cta:       meta.cta,
-                ctaTarget: 'chat-approval-plan',
+                label: intent.approvalPlan.title, icon: meta.icon,
+                count: intent.approvalPlan.count, detail: intent.approvalPlan.detail,
+                cta: meta.cta, ctaTarget: 'chat-approval-plan',
               }});
             }
-            return;
+            break;
           }
+
           case 'find_file': {
-            // Only run search if agent gave a query — don't re-search on generic messages
             const q = sanitizeSearchQuery(intent?.query?.trim() || '');
             if (q && q.length > 1) await handleFindFile(q);
-            return;
+            break;
           }
-          case 'scan_structure': {
-            // If the backend already built a real scan plan — use it directly.
+
+          case 'scan_structure':
+          case 'organize_folder': {
             if (intent?.approvalPlan) {
               setPlan(intent.approvalPlan);
               pendingOperationRef.current = null;
               push('assistant', { type: 'action', action: {
-                label:     intent.approvalPlan.title,
-                icon:      'Sparkles',
-                count:     intent.approvalPlan.count,
-                detail:    intent.approvalPlan.detail,
-                cta:       'Review & Approve',
-                ctaTarget: 'chat-approval-plan',
+                label: intent.approvalPlan.title, icon: 'Sparkles',
+                count: intent.approvalPlan.count, detail: intent.approvalPlan.detail,
+                cta: 'Approve & Organise', ctaTarget: 'chat-approval-plan',
               }});
-              return;
+            } else {
+              // No plan yet — run the local disk scan now using folder from intent or message
+              const folderHint = intent?.folderHint?.trim() || intent?.source?.trim() || '';
+              await handleScanStructure(folderHint, text);
             }
-            // No plan from backend — extract folder from user message and scan directly.
-            // Do NOT preset pendingOperationRef here; handleScanStructure will set it
-            // only if no plan comes back (folder already clean).
-            const hintFromMsg = (() => {
-              const tl = text.toLowerCase();
-              const FM: Record<string, string> = {
-                desktop: 'Desktop', downloads: 'Downloads', download: 'Downloads',
-                documents: 'Documents', document: 'Documents',
-                pictures: 'Pictures', picture: 'Pictures',
-                videos: 'Videos', music: 'Music',
-              };
-              for (const [alias, canonical] of Object.entries(FM)) {
-                if (tl.includes(alias)) return canonical;
-              }
-              return '';
-            })();
-            const hint = intent?.folderHint?.trim() || intent?.source?.trim() || hintFromMsg;
-            await handleScanStructure(hint || 'Desktop', text);
-            return;
+            break;
           }
-          case 'show_duplicates':  await handleDuplicates();   return;
-          case 'show_pending':     await handlePending();       return;
-          case 'organize_folder': {
-            const src = intent?.source?.trim() || intent?.folderHint?.trim() || '';
-            const dst = intent?.destination?.trim() || '';
-            if (src && dst) {
-              // Has both source and destination — build a move plan via backend
-              try {
-                const planRes = await fetch(`${API}/api/chat`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    message: `move files from ${src} to ${dst}`,
-                    threadId: threadIdRef.current,
-                  }),
-                });
-                const planData = await planRes.json() as AgentResponse;
-                if (planData.intent?.approvalPlan) {
-                  setPlan(planData.intent.approvalPlan);
-                  pendingOperationRef.current = null;
-                  push('assistant', { type: 'action', action: {
-                    label:     planData.intent.approvalPlan.title,
-                    icon:      'FolderOpen',
-                    count:     planData.intent.approvalPlan.count,
-                    detail:    planData.intent.approvalPlan.detail,
-                    cta:       'Approve & Move',
-                    ctaTarget: 'chat-approval-plan',
-                  }});
-                  return;
-                }
-              } catch { /* fall through */ }
-            }
-            // Single folder — extract from message if intent didn't give one
-            const folderForScan = src || (() => {
-              const tl = text.toLowerCase();
-              const FM: Record<string, string> = {
-                desktop: 'Desktop', downloads: 'Downloads', download: 'Downloads',
-                documents: 'Documents', document: 'Documents',
-                pictures: 'Pictures', picture: 'Pictures',
-                videos: 'Videos', music: 'Music',
-              };
-              for (const [alias, canonical] of Object.entries(FM)) {
-                if (tl.includes(alias)) return canonical;
-              }
-              return 'Desktop';
-            })();
-            await handleScanStructure(folderForScan, text);
-            return;
+
+          case 'show_duplicates': await handleDuplicates(); break;
+          case 'show_pending':    await handlePending();    break;
+
+          case 'show_structure': {
+            const folderHint = intent?.folderHint?.trim() || intent?.source?.trim() || '';
+            if (folderHint) await handleShowStructure(folderHint);
+            break;
           }
+
           default:
-            // Unknown intent but agent succeeded — reply already shown
-            return;
+            // Agent replied — nothing extra to do
+            break;
         }
+
       } catch (err) {
         console.error('[chat] IBM agent error:', (err as Error).message);
       }
 
-      // IBM agent FAILED — fall through to local pattern matching
+      // Agent FAILED — fall back to local routing (search, duplicates, stats)
       if (!agentSucceeded) {
-        const matched = await runLocalRouting(text);
-        if (!matched) {
-          push('assistant', {
-            type: 'text',
-            text: `I can help with:\n• **"move files from Desktop to Downloads"**\n• **"find resume.pdf"**\n• **"how many files are in Downloads"**\n• **"show duplicates"**\n• **"storage report"**\n• **"scan folder structure"**`,
-          });
-        }
+        await runLocalRouting(text);
       }
     });
   }, [
     typing, setPlan, push, withTyping, runLocalRouting,
-    handleFindFile, handleDuplicates, handlePending, handleCleanFolder, handleScanStructure,
+    handleFindFile, handleDuplicates, handlePending, handleScanStructure,
     handleShowStructure,
-    tryBuildOrganizeApprovalPlan,
   ]);
 
   const sendQuickAction    = useCallback((cmd: string) => sendMessage(cmd), [sendMessage]);
   const clearApprovalFiles = useCallback(() => setApprovalFiles(null), []);
   const clearApprovalPlan  = useCallback(() => setPlan(null), [setPlan]);
 
+  // ── Chat session persistence ───────────────────────────────────────────────
+
+  // ID of the currently-loaded session (null = unsaved / new session)
+  const sessionIdRef = useRef<string | null>(null);
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
+
+  /**
+   * Save (or update) the current messages to the backend.
+   * Returns the session id.
+   */
+  const saveSession = useCallback(async (): Promise<string | null> => {
+    if (messages.length === 0) return null;
+    try {
+      // Serialise messages — strip Date objects so JSON round-trips cleanly
+      const serialisable = messages.map((m) => ({
+        ...m,
+        timestamp: m.timestamp instanceof Date ? m.timestamp.toISOString() : m.timestamp,
+      }));
+      const body: Record<string, unknown> = {
+        messages:  serialisable,
+        threadId:  threadIdRef.current,
+      };
+      if (sessionIdRef.current) body.id = sessionIdRef.current;
+
+      const res  = await fetch(`${API}/api/sessions`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(body),
+      });
+      const data = await res.json() as { id?: string; error?: string };
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      if (data.id) {
+        sessionIdRef.current = data.id;
+        setCurrentSessionId(data.id);
+        return data.id;
+      }
+      throw new Error('Server returned no session ID');
+    } catch (err) {
+      console.error('[useChat] saveSession failed:', err);
+      throw err; // re-throw so ChatHistoryPanel can show the error
+    }
+  }, [messages]);
+
+  /**
+   * Load a saved session from the backend, restoring messages and thread ID.
+   */
+  const loadSession = useCallback(async (id: string): Promise<void> => {
+    try {
+      const res  = await fetch(`${API}/api/sessions/${id}`);
+      const data = await res.json() as {
+        id: string;
+        messages: any[];
+        thread_id?: string | null;
+        error?: string;
+      };
+      if (data.error) throw new Error(data.error);
+
+      const restored: ChatMessage[] = (data.messages ?? []).map((m: any) => ({
+        ...m,
+        timestamp: m.timestamp ? new Date(m.timestamp) : new Date(),
+      }));
+      setMessages(restored);
+      setApprovalPlan(null);
+      approvalPlanRef.current = null;
+      pendingOperationRef.current = null;
+      sessionIdRef.current = id;
+      setCurrentSessionId(id);
+      if (data.thread_id) threadIdRef.current = data.thread_id;
+    } catch (err) {
+      console.error('[useChat] loadSession failed:', err);
+    }
+  }, []);
+
+  /**
+   * Reset to a blank new session.
+   */
+  const newSession = useCallback((): void => {
+    setMessages([]);
+    setApprovalPlan(null);
+    setApprovalFiles(null);
+    approvalPlanRef.current   = null;
+    pendingOperationRef.current = null;
+    sessionIdRef.current      = null;
+    setCurrentSessionId(null);
+    threadIdRef.current       = null;
+  }, []);
+
+  /**
+   * Delete a session from the backend.
+   */
+  const deleteSession = useCallback(async (id: string): Promise<void> => {
+    try {
+      await fetch(`${API}/api/sessions/${id}`, { method: 'DELETE' });
+      if (sessionIdRef.current === id) newSession();
+    } catch (err) {
+      console.error('[useChat] deleteSession failed:', err);
+    }
+  }, [newSession]);
+
   return {
     messages, typing,
-    // mode/setMode kept for backward compat but no longer used for panel
+    // mode/setMode kept for backward compat
     mode: 'command' as const, setMode: (_: any) => {},
     approvalFiles, clearApprovalFiles,
     approvalPlan, clearApprovalPlan,
     openPlanModalRef,
     sendMessage, sendQuickAction,
     pushMessage: push,
+    // session persistence
+    saveSession, loadSession, newSession, deleteSession,
+    currentSessionId,
   };
 }

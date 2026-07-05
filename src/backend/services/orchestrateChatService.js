@@ -13,6 +13,40 @@ const ORCHESTRATE_AGENT_ID = (process.env.WATSONX_AGENT_ID || '29847e54-fe41-4af
 
 let threadId = null;
 
+// ── Per-thread context store ──────────────────────────────────────────────────
+// Remembers the last file(s) the agent mentioned per thread so pronouns like
+// "delete it", "move it", "it" can be resolved without re-asking the user.
+// Structure: Map<threadId, { files: [{name, sourcePath, sizeBytes}], folder: string }>
+const threadFileContext = new Map();
+
+/**
+ * Store the last found file(s) for a thread so follow-up pronouns work.
+ */
+function storeThreadFileContext(tid, files, folder) {
+  if (!tid) return;
+  threadFileContext.set(tid, { files, folder, updatedAt: Date.now() });
+  // Evict entries older than 30 minutes to prevent unbounded growth
+  const cutoff = Date.now() - 30 * 60 * 1000;
+  for (const [k, v] of threadFileContext.entries()) {
+    if (v.updatedAt < cutoff) threadFileContext.delete(k);
+  }
+}
+
+/**
+ * Retrieve the last found file context for a thread.
+ */
+function getThreadFileContext(tid) {
+  if (!tid) return null;
+  const ctx = threadFileContext.get(tid);
+  if (!ctx) return null;
+  // Expire after 30 minutes
+  if (Date.now() - ctx.updatedAt > 30 * 60 * 1000) {
+    threadFileContext.delete(tid);
+    return null;
+  }
+  return ctx;
+}
+
 // Track the last time each folder was organized so we can force-refresh context
 // after an organize/move operation completes.
 const lastOrganizedAt = new Map(); // folderPath -> Date.now()
@@ -39,6 +73,7 @@ const INTENT = {
 Object.values(INTENT).forEach((value) => VALID_INTENTS.add(value));
 
 const FOLDER_ALIASES = {
+  // Standard user folders
   desktop: 'Desktop',
   desktops: 'Desktop',
   download: 'Downloads',
@@ -55,18 +90,57 @@ const FOLDER_ALIASES = {
   audio: 'Music',
   video: 'Videos',
   videos: 'Videos',
+  // Extra common folders
+  home: 'Home',
+  'home folder': 'Home',
+  'my documents': 'Documents',
+  'my pictures': 'Pictures',
+  'my videos': 'Videos',
+  'my music': 'Music',
+  'my downloads': 'Downloads',
+  // Windows drives / root
+  'c drive': 'C:',
+  'c:': 'C:',
+  'c:\\': 'C:',
+  'c:/': 'C:',
+  'local disk': 'C:',
+  // OneDrive
+  onedrive: 'OneDrive',
+  'one drive': 'OneDrive',
+  // Common dev / work folders
+  projects: 'Projects',
+  project: 'Projects',
+  repos: 'Projects',
+  code: 'Projects',
+  workspace: 'Projects',
+  // Temp / misc
+  temp: 'Temp',
+  tmp: 'Temp',
+  temporary: 'Temp',
 };
 
 function getDefaultFolders() {
   const home = os.homedir();
-  return {
-    Desktop: path.join(home, 'Desktop'),
+  const folders = {
+    Desktop:   path.join(home, 'Desktop'),
     Downloads: path.join(home, 'Downloads'),
     Documents: path.join(home, 'Documents'),
-    Pictures: path.join(home, 'Pictures'),
-    Music: path.join(home, 'Music'),
-    Videos: path.join(home, 'Videos'),
+    Pictures:  path.join(home, 'Pictures'),
+    Music:     path.join(home, 'Music'),
+    Videos:    path.join(home, 'Videos'),
+    Home:      home,
+    // Common Windows extras
+    OneDrive:  path.join(home, 'OneDrive'),
+    Projects:  path.join(home, 'Projects'),
+    Temp:      os.tmpdir(),
   };
+
+  // NOTE: C:\ root is intentionally NOT included here.
+  // Scanning C:\ enumerates system-protected subdirectories (MSOCache, System Volume
+  // Information, $Recycle.Bin, etc.) which throw EPERM errors and are never valid
+  // places for user files to be moved to/from.
+
+  return folders;
 }
 
 async function getWatchedFolders() {
@@ -190,24 +264,62 @@ function formatFileListForPrompt(folderLabel, files) {
 
 /**
  * Detect which folders are relevant to the user's message so we only scan those.
+ * Handles:
+ *  - Known aliases (desktop, downloads, c drive, etc.)
+ *  - Absolute paths anywhere in the message (C:\..., /home/..., etc.)
+ *  - Quoted folder names ("My Projects")
  */
 function detectRelevantFolders(message, defaultFolders) {
   const t = message.toLowerCase();
   const relevant = [];
 
+  const addIfNew = (label, folderPath) => {
+    if (!relevant.find((f) => f.path === folderPath)) {
+      relevant.push({ label, path: folderPath });
+    }
+  };
+
+  // 1. Match known aliases
   for (const [alias, canonical] of Object.entries(FOLDER_ALIASES)) {
-    if (t.includes(alias) && defaultFolders[canonical]) {
-      if (!relevant.find((f) => f.label === canonical)) {
-        relevant.push({ label: canonical, path: defaultFolders[canonical] });
+    if (t.includes(alias)) {
+      const folderPath = defaultFolders[canonical];
+      if (folderPath) addIfNew(canonical, folderPath);
+      else {
+        // canonical may itself be an alias for a resolved path
+        const resolved = resolveFolderRef(canonical);
+        if (resolved) addIfNew(resolved.label, resolved.path);
       }
     }
   }
 
-  // If no specific folder mentioned, include Desktop and Downloads
+  // 2. Extract absolute Windows paths (C:\...) or Unix paths (/home/...)
+  const WIN_PATH  = /[A-Za-z]:[\\\/][^\s"',;)>]*/g;
+  const UNIX_PATH = /\/(?:home|usr|var|tmp|mnt|media|opt|root)[^\s"',;)>]*/g;
+  for (const re of [WIN_PATH, UNIX_PATH]) {
+    let m;
+    while ((m = re.exec(message)) !== null) {
+      const raw = m[0].replace(/[\\\/]+$/, ''); // strip trailing slashes
+      if (raw.length > 2) addIfNew(raw, raw);
+    }
+  }
+
+  // 3. Quoted folder names that might be custom paths: "My Projects", "Work Stuff"
+  const QUOTED = /["']([^"']{3,80})["']/g;
+  let qm;
+  while ((qm = QUOTED.exec(message)) !== null) {
+    const candidate = qm[1].trim();
+    // Skip if it looks like a filename (has extension)
+    if (/\.[a-z0-9]{1,6}$/i.test(candidate)) continue;
+    // Try to resolve relative to home
+    const resolved = resolveFolderRef(candidate);
+    if (resolved) addIfNew(resolved.label, resolved.path);
+  }
+
+  // 4. Fallback: if nothing matched, scan Desktop + Downloads
   if (relevant.length === 0) {
     const fallbacks = ['Desktop', 'Downloads'];
     for (const label of fallbacks) {
-      if (defaultFolders[label]) relevant.push({ label, path: defaultFolders[label] });
+      if (defaultFolders[label]) addIfNew(label, defaultFolders[label]);
     }
   }
 
@@ -245,6 +357,7 @@ function buildSystemPrompt(context) {
     'You are SmartDesk AI, a desktop file organizer assistant running on the user\'s computer.',
     'You have been given REAL, LIVE file system data below — use it to answer questions accurately.',
     'IMPORTANT: The file system context below was just read from disk right now. It reflects the current actual state of the folders, including any recent organising or moves. Always trust this injected data over anything in conversation history.',
+    'You can work with ANY folder on the user\'s system — not just the standard ones. If the user mentions a path like C:\\Users\\ASUS\\Projects or any custom folder, use it directly as the source or destination.',
     'Interpret the user message and choose exactly one intent.',
     'Be conversational, friendly, and concise in the reply field.',
     'Never claim a file was moved, deleted, or renamed already. File changes require approval first.',
@@ -255,9 +368,9 @@ function buildSystemPrompt(context) {
     '  "intent": {',
     '    "type": "chat | move_files | delete_file | rename_file | create_folder | move_folder | find_file | show_duplicates | storage_report | scan_structure | show_pending | organize_folder | count_folder_items",',
     '    "query": "string or null",',
-    '    "source": "folder name/path or null",',
-    '    "destination": "folder name/path or null",',
-    '    "folderHint": "folder name/path or null"',
+    '    "source": "folder name/path or null — can be ANY path the user mentioned",',
+    '    "destination": "folder name/path or null — can be ANY path the user mentioned",',
+    '    "folderHint": "folder name/path or null — can be ANY path the user mentioned"',
     '  }',
     '}',
     'Use move_files when the user wants files moved from one folder to another.',
@@ -273,15 +386,16 @@ function buildSystemPrompt(context) {
     'For count_folder_items, answer the count directly from the file system context above.',
     'For largest/smallest file questions, inspect the file system context and answer with the filename and size.',
     'When the user asks to "show structure", "show what is in", or "list contents" of a folder, use type "chat" and describe the current folder layout using the injected file system context (subfolders and files listed above).',
+    'If the user mentions a drive (like C: drive, D: drive) or any absolute path, set source/folderHint to that path exactly.',
     'If you are missing details for an action, keep the reply conversational and set type to chat.',
     'Examples:',
     '{"reply":"I found resume.pdf in Downloads (245KB).","intent":{"type":"find_file","query":"resume","source":null,"destination":null,"folderHint":"Downloads"}}',
     '{"reply":"There are 42 files directly in Downloads.","intent":{"type":"count_folder_items","query":null,"source":"Downloads","destination":null,"folderHint":"Downloads"}}',
-    '{"reply":"The largest file in Downloads is video.mp4 at 2.3GB.","intent":{"type":"chat","query":null,"source":"Downloads","destination":null,"folderHint":null}}',
+    '{"reply":"I can prepare a plan to organise C:\\\\Users\\\\ASUS\\\\Projects.","intent":{"type":"organize_folder","query":null,"source":"C:\\\\Users\\\\ASUS\\\\Projects","destination":null,"folderHint":"C:\\\\Users\\\\ASUS\\\\Projects"}}',
     '{"reply":"I can prepare a plan to move nasri rifana resume.pdf from Desktop to Downloads.","intent":{"type":"move_files","query":null,"source":"Desktop","destination":"Downloads","folderHint":"Desktop"}}',
     '{"reply":"I can prepare a plan to delete report.pdf from Desktop. It will be moved to SmartDesk Trash safely.","intent":{"type":"delete_file","query":"report.pdf","source":"Desktop","destination":null,"folderHint":"Desktop"}}',
     `Available watched folders: ${JSON.stringify(context.watchedFolders)}`,
-    `Default folders: ${JSON.stringify(context.defaultFolders)}`,
+    `Default folders available: ${JSON.stringify(context.defaultFolders)}`,
     context.fileSystemContext || '',
   ].filter(Boolean).join('\n');
 }
@@ -399,26 +513,88 @@ function normalizeTextField(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
-function inferIntentFromPlainText(text) {
-  const t = text.toLowerCase();
-  if (/\bcreate\b.*\bfolder\b/.test(t))
+/**
+ * Classify intent purely from the text of a message (either the user's original
+ * message or the agent's reply when it doesn't return JSON).
+ *
+ * This is the safety net used when the IBM Orchestrate agent ignores the system
+ * prompt and returns a free-form response instead of the required JSON structure.
+ * It must be reliable enough to correctly route every common action.
+ *
+ * @param {string} text        The text to classify (agent reply or user message)
+ * @param {string} [userMsg]   The original user message — preferred when available
+ */
+function inferIntentFromText(text, userMsg) {
+  // Always prefer classifying from the original user message when available —
+  // it's shorter, more direct, and not contaminated by the agent's verbose refusals.
+  const primary = (userMsg || text || '').toLowerCase();
+  const fallback = (text || '').toLowerCase();
+
+  const t = primary || fallback;
+
+  // ── Delete / remove / trash ──────────────────────────────────────────────
+  if (/\b(delete|remove|trash|erase|get\s+rid\s+of|wipe)\b/i.test(t))
+    return { type: INTENT.DELETE_FILE, query: null, source: null, destination: null, folderHint: null };
+
+  // ── Rename ────────────────────────────────────────────────────────────────
+  if (/\brename\b/i.test(t))
+    return { type: INTENT.RENAME_FILE, query: null, source: null, destination: null, folderHint: null };
+
+  // ── Create folder ─────────────────────────────────────────────────────────
+  if (/\b(create|make|new)\b.*\bfolder\b/i.test(t))
     return { type: INTENT.CREATE_FOLDER, query: null, source: null, destination: null, folderHint: null };
-  if (/\bmove\b.*\bfolder\b.*\bto\b/.test(t))
+
+  // ── Move folder ───────────────────────────────────────────────────────────
+  if (/\bmove\b.*\bfolder\b.*\bto\b/i.test(t))
     return { type: INTENT.MOVE_FOLDER, query: null, source: null, destination: null, folderHint: null };
-  if (/\b(find|search|look|where|locat)\b/.test(t))
+
+  // ── Move files ────────────────────────────────────────────────────────────
+  if (/\bmove\b.*\b(from|to)\b/i.test(t))
+    return { type: INTENT.MOVE_FILES, query: null, source: null, destination: null, folderHint: null };
+
+  // ── Find / search / list (broad — catches "list all exe", "show me pdfs", etc.) ──
+  if (/\b(find|where\s+is|locate|search(\s+for|\s+through)?|look\s+for|list\s+(all|the|my)?|show\s+(me\s+)?all|show\s+(me\s+)?the|get\s+(me\s+)?all)\b/i.test(t))
     return { type: INTENT.FIND_FILE, query: null, source: null, destination: null, folderHint: null };
-  if (/\b(duplicat|copies|same file)\b/.test(t))
+
+  // ── Duplicates ────────────────────────────────────────────────────────────
+  if (/\b(duplicate|duplicate\s+files?|same\s+file|copies)\b/i.test(t))
     return { type: INTENT.SHOW_DUPLICATES, query: null, source: null, destination: null, folderHint: null };
-  if (/\b(storage|disk|space|usage)\b/.test(t))
+
+  // ── Storage / disk usage ──────────────────────────────────────────────────
+  if (/\b(storage\s+report|disk\s+usage|disk\s+space|how\s+much\s+space|storage\s+usage)\b/i.test(t))
     return { type: INTENT.STORAGE_REPORT, query: null, source: null, destination: null, folderHint: null };
-  if (/\b(how many|count|number of files)\b/.test(t))
+
+  // ── Count files ───────────────────────────────────────────────────────────
+  if (/\b(how\s+many\s+files?|count\s+(?:the\s+)?files?|number\s+of\s+files?)\b/i.test(t))
     return { type: INTENT.COUNT_FOLDER_ITEMS, query: null, source: null, destination: null, folderHint: null };
-  if (/\b(move|organis|organiz|clean)\b/.test(t))
+
+  // ── Organise / clean ──────────────────────────────────────────────────────
+  if (/\b(organis[e]?|organiz[e]?|clean\s+up|tidy\s+up|sort\s+out)\b/i.test(t))
     return { type: INTENT.ORGANIZE_FOLDER, query: null, source: null, destination: null, folderHint: null };
+
+  // ── Scan / analyse structure ──────────────────────────────────────────────
+  if (/\b(scan|analyse?|analyze)\b.*\b(folder|structure|files?)\b/i.test(t))
+    return { type: INTENT.SCAN_STRUCTURE, query: null, source: null, destination: null, folderHint: null };
+
+  // ── Pending approvals ──────────────────────────────────────────────────────
+  if (/\b(pending|waiting\s+for\s+approval|show\s+pending)\b/i.test(t))
+    return { type: INTENT.SHOW_PENDING, query: null, source: null, destination: null, folderHint: null };
+
   return { type: INTENT.CHAT, query: null, source: null, destination: null, folderHint: null };
 }
 
-function normalizeIntent(raw) {
+// Keep old name as alias so nothing else breaks
+const inferIntentFromPlainText = inferIntentFromText;
+
+/**
+ * Parse the agent response (JSON or plain text) into a normalized reply+intent.
+ *
+ * @param {string}      raw             Raw text from the agent
+ * @param {string|null} originalUserMsg The user's original message — used to
+ *                                      correctly infer intent when the agent
+ *                                      ignores the JSON format instruction.
+ */
+function normalizeIntent(raw, originalUserMsg) {
   // Try to parse structured JSON first
   const parsed = parseJsonObject(raw);
 
@@ -447,13 +623,49 @@ function normalizeIntent(raw) {
     };
   }
 
-  // Agent returned plain text (not JSON) — treat as conversational reply
-  // but also try to infer intent from the raw text
+  // Agent returned plain text (not JSON) — the IBM Orchestrate agent ignored the
+  // system prompt JSON instruction. Use the agent's text as the user-facing reply
+  // but infer the intent from the ORIGINAL USER MESSAGE (more reliable than the
+  // agent's verbose refusal text which often doesn't mention the action type).
   const plainText = (typeof raw === 'string' ? raw : '').trim();
   if (plainText) {
-    const inferred = inferIntentFromPlainText(plainText);
+    const inferred = inferIntentFromText(plainText, originalUserMsg);
+
+    // Detect agent "refusal" or confusion responses (agent acting like a general
+    // assistant instead of SmartDesk). Replace them with a helpful SmartDesk reply.
+    // IMPORTANT: do NOT replace replies that contain useful file info (paths, sizes,
+    // locations) — those are legitimate answers the user needs to see.
+    const hasUsefulFileInfo =
+      /\b(found|located|present|exists?|path|folder|directory|downloads?|desktop|documents?|pictures?|\.jpg|\.png|\.pdf|\.exe|\.mp4|\.zip|→|├|└|KB|MB|GB)\b/i.test(plainText);
+
+    const isAgentConfusion =
+      !hasUsefulFileInfo && (
+        /I\s+(don'?t|do\s+not|cannot|can'?t)\s+(have|access|use|perform|execute|directly)\b/i.test(plainText) ||
+        /\b(filesystem|file\s*system|modification\s+tool|command.?line\s+access|tool\s+available|no\s+tool)\b/i.test(plainText) ||
+        /\b(provide\s+a\s+tool|provide\s+command|allow\s+file\s+removal|execute\s+the\s+plan\s+immediately)\b/i.test(plainText) ||
+        // IBM saying it has no environment/tool to execute the operation
+        /\b(environment\s+does\s+not\s+provide|does\s+not\s+provide\s+a?\s+file|no\s+file.?system\s+tool|cannot\s+invoke|grant\s+access\s+to\s+a\s+(deletion|file|tool))\b/i.test(plainText) ||
+        /\b(run\s+the\s+deletions\s+from\s+your\s+side|carry\s+out\s+the\s+deletions|need\s+a\s+tool\s+that\s+can\s+(remove|delete|move))\b/i.test(plainText)
+      );
+
+    let replyToUser = plainText;
+    if (isAgentConfusion) {
+      // Build a helpful contextual reply based on the inferred intent
+      if (inferred.type === INTENT.DELETE_FILE) {
+        replyToUser = 'I can prepare a safe deletion plan for those files. SmartDesk will move them to the Trash folder (recoverable) — nothing is permanently deleted without your approval.';
+      } else if (inferred.type === INTENT.MOVE_FILES) {
+        replyToUser = 'I can prepare a move plan for those files. Review it and approve before anything is changed.';
+      } else if (inferred.type === INTENT.ORGANIZE_FOLDER || inferred.type === INTENT.SCAN_STRUCTURE) {
+        replyToUser = 'I can scan that folder and build an organisation plan. Review the suggested moves and approve to proceed.';
+      } else if (inferred.type === INTENT.FIND_FILE) {
+        replyToUser = 'Let me search for that file across your watched folders.';
+      } else {
+        replyToUser = 'I can help with that. Let me prepare the plan — everything needs your approval before any files are changed.';
+      }
+    }
+
     return {
-      reply: plainText,
+      reply: replyToUser,
       intent: inferred,
       meta: { source: 'ibm', available: true },
     };
@@ -494,21 +706,58 @@ function resolveFolderRef(input) {
   if (!cleaned) return null;
 
   const defaults = getDefaultFolders();
-  const aliasKey = cleaned.toLowerCase();
-  const mapped = FOLDER_ALIASES[aliasKey];
-  if (mapped && defaults[mapped]) {
-    return { label: mapped, path: defaults[mapped] };
-  }
 
+  // 1. Exact match in defaults (case-insensitive)
+  const lc = cleaned.toLowerCase();
+  const exactDefault = Object.entries(defaults).find(([label]) => label.toLowerCase() === lc);
+  if (exactDefault) return { label: exactDefault[0], path: exactDefault[1] };
+
+  // 2. Alias lookup
+  const mapped = FOLDER_ALIASES[lc];
+  if (mapped && defaults[mapped]) return { label: mapped, path: defaults[mapped] };
+
+  // 3. Already absolute path
   if (path.isAbsolute(cleaned)) {
     return { label: cleaned, path: cleaned };
   }
 
-  const exactDefault = Object.entries(defaults).find(([label]) => label.toLowerCase() === aliasKey);
-  if (exactDefault) {
-    return { label: exactDefault[0], path: exactDefault[1] };
+  // 4. Windows drive root shorthand: "C:", "D:" etc.
+  if (/^[A-Za-z]:$/.test(cleaned)) {
+    return { label: cleaned.toUpperCase(), path: cleaned.toUpperCase() + '\\' };
   }
 
+  // 5. Looks like a relative sub-path (e.g. "Users/ASUS/Projects") — resolve under drive root on Windows
+  if (process.platform === 'win32' && /^[A-Za-z]:[\\\/]/.test(cleaned)) {
+    return { label: cleaned, path: cleaned };
+  }
+
+  // 6. Subfolder path like "Downloads/Images" or "Downloads\Images" —
+  //    check if the first segment is a known top-level folder alias,
+  //    then resolve the full path under home.
+  //    e.g. "Downloads/Images" → home/Downloads/Images with label "Downloads/Images"
+  const sep = cleaned.includes('/') ? '/' : cleaned.includes('\\') ? '\\' : null;
+  if (sep) {
+    const parts = cleaned.split(/[/\\]/);
+    const topSegment = parts[0].toLowerCase();
+    // Check if the top segment resolves to a known folder alias or default folder name
+    const topAlias = FOLDER_ALIASES[topSegment];
+    const topDefaultKey = topAlias
+      ? topAlias
+      : Object.keys(defaults).find((k) => k.toLowerCase() === topSegment);
+    const topDefault = topDefaultKey ? defaults[topDefaultKey] : null;
+    if (topDefault) {
+      // Build full path: replace the first segment with the resolved absolute path
+      const rest = parts.slice(1);
+      const resolvedPath = path.join(topDefault, ...rest);
+      // Use the original input as the label (e.g. "Downloads/Images") to preserve context
+      return { label: cleaned, path: resolvedPath };
+    }
+    // Even if top segment isn't known, try resolving relative to home
+    const homeCandidate = path.join(os.homedir(), cleaned);
+    return { label: cleaned, path: homeCandidate };
+  }
+
+  // 7. Try home/<name>
   const homeCandidate = path.join(os.homedir(), cleaned);
   return { label: cleaned, path: homeCandidate };
 }
@@ -610,10 +859,26 @@ function createUniqueTarget(basePath, existingNames) {
   }
 }
 
+/**
+ * Extract the specific filename from a message.
+ * Also handles path references like "Downloads/Images/aizen.jpg" — returns
+ * just the basename ("aizen.jpg") and stores the folder hint as a side-effect
+ * via the returned object's folderRef property when the path has a folder prefix.
+ *
+ * Returns a string (filename) or null if none found.
+ * When a path reference is found, the returned string is the basename only —
+ * use extractSpecificFileWithFolder for the full result.
+ */
 function extractSpecificFile(message) {
   // Match quoted filenames: "resume.pdf" or 'resume.pdf'
   const quoted = message.match(/["']([^"']+\.[a-z0-9]+)["']/i);
-  if (quoted) return quoted[1];
+  if (quoted) return path.basename(quoted[1]); // strip any path prefix from quoted names
+
+  // Match path-like references: Downloads/Images/aizen.jpg or Downloads\Images\aizen.jpg
+  // This handles "delete the Downloads/Images/aizen.jpg" style messages
+  const pathRef = message.match(/\b([A-Za-z][A-Za-z0-9_\s\-]*[/\\][A-Za-z0-9_\s/\\\-\.]+\.(pdf|docx?|txt|jpg|jpeg|png|mp4|mp3|exe|msi|zip|rar|csv|xlsx?|iso|dmg|deb|rpm|7z|tar|gz|apk|jar))\b/i);
+  if (pathRef) return path.basename(pathRef[1]);
+
   // Match "file named X" or "file called X" or "named X" or "called X"
   const named = message.match(/(?:file\s+(?:named|called)\s+|named\s+|called\s+)([^\s,]+\.[a-z0-9]+)/i);
   if (named) return named[1];
@@ -639,6 +904,40 @@ function extractSpecificFile(message) {
     if (hint && !generic.test(hint)) return hint;
   }
   return null;
+}
+
+/**
+ * Like extractSpecificFile but also returns the folder path prefix if the user
+ * specified a path like "Downloads/Images/aizen.jpg".
+ * Returns { filename, folderRef } where folderRef may be null.
+ */
+function extractSpecificFileWithFolder(message) {
+  // Match path-like references: Downloads/Images/aizen.jpg or Downloads\Images\aizen.jpg
+  const pathRef = message.match(/\b([A-Za-z][A-Za-z0-9_\s\-]*[/\\][A-Za-z0-9_\s/\\\-\.]+\.(pdf|docx?|txt|jpg|jpeg|png|mp4|mp3|exe|msi|zip|rar|csv|xlsx?|iso|dmg|deb|rpm|7z|tar|gz|apk|jar))\b/i);
+  if (pathRef) {
+    const fullPath = pathRef[1];
+    const parts = fullPath.split(/[/\\]/);
+    const filename = parts[parts.length - 1];
+    const folderRef = parts.slice(0, -1).join('/');
+    return { filename, folderRef: folderRef || null };
+  }
+
+  // Quoted path references: "Downloads/Images/aizen.jpg"
+  const quoted = message.match(/["']([^"']+\.[a-z0-9]+)["']/i);
+  if (quoted) {
+    const fullPath = quoted[1];
+    const sep = fullPath.includes('/') || fullPath.includes('\\');
+    if (sep) {
+      const parts = fullPath.split(/[/\\]/);
+      const filename = parts[parts.length - 1];
+      const folderRef = parts.slice(0, -1).join('/');
+      return { filename, folderRef: folderRef || null };
+    }
+    return { filename: fullPath, folderRef: null };
+  }
+
+  const filename = extractSpecificFile(message);
+  return { filename, folderRef: null };
 }
 
 function selectFilesByHint(files, fileHint) {
@@ -675,20 +974,82 @@ function selectFilesByHint(files, fileHint) {
   if (partial.length === 1) return { type: 'single', files: partial };
   if (partial.length > 1) return { type: 'ambiguous', files: partial };
 
+  // Word-level partial match: "aizen image" → each word checked against basename.
+  // This handles natural-language hints without an extension,
+  // e.g. "aizen image" should match "aizen.jpg" because the first word "aizen"
+  // matches the file's basename.
+  const hintWords = cleanedHint.split(/\s+/).filter((w) => w.length > 2);
+  if (hintWords.length > 0) {
+    const wordMatch = files.filter((f) => {
+      const lowerBase = path.parse(f.name.toLowerCase()).name;
+      return hintWords.every((w) => lowerBase.includes(w)) ||
+             hintWords.some((w) => lowerBase === w);
+    });
+    if (wordMatch.length === 1) return { type: 'single', files: wordMatch };
+    if (wordMatch.length > 1) return { type: 'ambiguous', files: wordMatch };
+  }
+
   return { type: 'none', files: [] };
 }
 
 async function buildDeletePlan(intent, specificFile = null) {
-  const source = resolveFolderRef(intent.source || intent.folderHint);
+  const rawSource = intent.source || intent.folderHint;
+  let source = resolveFolderRef(rawSource);
 
+  // When IBM returns delete_file with no source, search all watched folders
   if (!source) {
-    return {
-      reply: 'I need to know which folder the file is in before I can prepare a delete plan.',
-      intent: { type: INTENT.CHAT, query: null, source: null, destination: null, folderHint: null },
-    };
+    const fileHint = normalizeTextField(specificFile || intent.query);
+    if (fileHint) {
+      // Try to find the file across all default folders
+      const found = await findSingleFileAcrossDefaultFolders(fileHint);
+      if (found.type === 'single' && found.match) {
+        source = { label: path.basename(found.match.folderPath), path: found.match.folderPath };
+      } else if (found.type === 'ambiguous') {
+        const options = found.matches.slice(0, 5).map((m) => `"${m.file.name}" in ${path.basename(m.folderPath)}`).join(', ');
+        return {
+          reply: `I found multiple matches for "${fileHint}": ${options}. Which one do you want to delete?`,
+          intent: { type: INTENT.CHAT, query: null, source: null, destination: null, folderHint: null },
+        };
+      }
+    }
+    // Still no source — fall back to watched folders as the search scope
+    if (!source) {
+      const watchedPaths = await getWatchedFolders();
+      if (watchedPaths.length > 0) {
+        source = { label: path.basename(watchedPaths[0]), path: watchedPaths[0] };
+      } else {
+        return {
+          reply: 'I need to know which folder the file is in before I can prepare a delete plan. Could you tell me where to look?',
+          intent: { type: INTENT.CHAT, query: null, source: null, destination: null, folderHint: null },
+        };
+      }
+    }
   }
 
-  const sourceExists = await ensureFolderExists(source.path);
+  // If the resolved folder doesn't exist, it might be a subfolder path like
+  // "Downloads/Images" — try resolving it relative to home.
+  let sourceExists = await ensureFolderExists(source.path);
+  if (!sourceExists && rawSource) {
+    const homeBased = path.join(os.homedir(), rawSource);
+    if (await ensureFolderExists(homeBased)) {
+      source = { label: rawSource, path: homeBased };
+      sourceExists = true;
+    }
+  }
+
+  if (!sourceExists) {
+    // Last resort: search the file across all default folders
+    const fileHint = normalizeTextField(specificFile || intent.query);
+    if (fileHint) {
+      const found = await findSingleFileAcrossDefaultFolders(fileHint);
+      if (found.type === 'single' && found.match) {
+        source = { label: path.basename(found.match.folderPath), path: found.match.folderPath };
+        sourceExists = true;
+        intent = { ...intent, source: source.label };
+      }
+    }
+  }
+
   if (!sourceExists) {
     return {
       reply: `I could not find the folder "${source.label}" on this device.`,
@@ -698,33 +1059,99 @@ async function buildDeletePlan(intent, specificFile = null) {
 
   // Determine which file(s) to delete
   const fileToDelete = normalizeTextField(specificFile || intent.query);
+  const allFiles = await listDirectFiles(source.path);
+
+  // When no specific file name given, include ALL files in the folder.
+  // This handles "delete the exe files", "delete unnecessary files", etc.
+  // where IBM has the context but didn't parse an exact filename.
   if (!fileToDelete) {
+    if (allFiles.length === 0) {
+      return {
+        reply: `There are no files directly in **${source.label}** to delete.`,
+        intent: { type: INTENT.CHAT, query: null, source: source.label, destination: null, folderHint: source.label },
+      };
+    }
+    // Include all files — the approval modal lets the user deselect any they want to keep
+    const trashDir = path.join(os.homedir(), '.SmartDesk', 'Trash');
+    const planId = crypto.randomUUID();
+    const existingNames = new Set();
+    const items = allFiles.map((file) => ({
+      operation: 'delete',
+      name: file.name,
+      sourcePath: file.sourcePath,
+      targetPath: createUniqueTarget(path.join(trashDir, file.name), existingNames),
+      newName: null,
+      sizeBytes: file.sizeBytes,
+    }));
+    const plan = {
+      id: planId,
+      type: INTENT.DELETE_FILE,
+      title: `Delete ${items.length} file${items.length === 1 ? '' : 's'} from ${source.label}`,
+      detail: 'Files will be moved to ~/.SmartDesk/Trash/ and can be recovered.',
+      sourceLabel: source.label,
+      destinationLabel: 'SmartDesk Trash',
+      sourcePath: source.path,
+      destinationPath: trashDir,
+      count: items.length,
+      items,
+      createdAt: new Date().toISOString(),
+    };
+    planStore.set(planId, plan);
     return {
-      reply: 'Please specify which file you want to delete.',
-      intent: { type: INTENT.CHAT, query: null, source: source.label, destination: null, folderHint: source.label },
+      reply: `I prepared a plan to delete **${items.length} file${items.length === 1 ? '' : 's'}** from **${source.label}**. They will be moved to SmartDesk Trash (recoverable). Review and approve to proceed.`,
+      intent: {
+        type: INTENT.DELETE_FILE,
+        query: null,
+        source: source.label,
+        destination: 'SmartDesk Trash',
+        folderHint: source.label,
+        approvalPlan: plan,
+      },
     };
   }
 
-  const allFiles = await listDirectFiles(source.path);
   const picked = selectFilesByHint(allFiles, fileToDelete);
   let filesToDelete = [];
 
   if (picked.type === 'none') {
-    return {
-      reply: `I could not find "${fileToDelete}" in ${source.label}.`,
-      intent: { type: INTENT.CHAT, query: null, source: source.label, destination: null, folderHint: source.label },
-    };
+    // File not found in the stated source folder — search across all folders
+    // (including subdirectories) to find the actual current location.
+    // This handles the case where IBM's thread memory has a stale source.
+    if (fileToDelete) {
+      const found = await findSingleFileAcrossDefaultFolders(fileToDelete);
+      if (found.type === 'single' && found.match) {
+        // Found it somewhere else — update source and re-run from there
+        source = { label: found.match.folderPath, path: found.match.folderPath };
+        filesToDelete = [found.match.file];
+      } else if (found.type === 'ambiguous') {
+        const options = found.matches.slice(0, 5)
+          .map((m) => `"${m.file.name}" in ${path.basename(m.folderPath)}`).join(', ');
+        return {
+          reply: `I found "${fileToDelete}" in multiple places: ${options}. Which one should I delete?`,
+          intent: { type: INTENT.CHAT, query: null, source: null, destination: null, folderHint: null },
+        };
+      } else {
+        return {
+          reply: `I could not find "${fileToDelete}" in ${source.label} or any of your standard folders.`,
+          intent: { type: INTENT.CHAT, query: null, source: source.label, destination: null, folderHint: source.label },
+        };
+      }
+    } else {
+      return {
+        reply: `I could not find "${fileToDelete}" in ${source.label}.`,
+        intent: { type: INTENT.CHAT, query: null, source: source.label, destination: null, folderHint: source.label },
+      };
+    }
+  } else {
+    if (picked.type === 'ambiguous') {
+      const options = picked.files.slice(0, 5).map((f) => `"${f.name}"`).join(', ');
+      return {
+        reply: `I found multiple matches for "${fileToDelete}" in ${source.label}: ${options}. Please tell me the exact file name to delete.`,
+        intent: { type: INTENT.CHAT, query: null, source: source.label, destination: null, folderHint: source.label },
+      };
+    }
+    filesToDelete = picked.files;
   }
-
-  if (picked.type === 'ambiguous') {
-    const options = picked.files.slice(0, 5).map((f) => `"${f.name}"`).join(', ');
-    return {
-      reply: `I found multiple matches for "${fileToDelete}" in ${source.label}: ${options}. Please tell me the exact file name to delete.`,
-      intent: { type: INTENT.CHAT, query: null, source: source.label, destination: null, folderHint: source.label },
-    };
-  }
-
-  filesToDelete = picked.files;
 
   // SmartDesk Trash folder — safe, recoverable
   const trashDir = path.join(os.homedir(), '.SmartDesk', 'Trash');
@@ -770,20 +1197,54 @@ async function buildDeletePlan(intent, specificFile = null) {
 }
 
 async function buildMovePlan(intent, specificFile = null) {
-  const source = resolveFolderRef(intent.source || intent.folderHint);
   const destination = resolveFolderRef(intent.destination);
+  let source = resolveFolderRef(intent.source || intent.folderHint);
 
-  if (!source || !destination) {
+  // When source is missing but we have a file hint, search for the file
+  // across all watched/default folders to auto-discover the source
+  if (!source) {
+    const fileHint = normalizeTextField(specificFile || intent.query);
+    if (fileHint && destination) {
+      const found = await findSingleFileAcrossDefaultFolders(fileHint);
+      if (found.type === 'single' && found.match) {
+        source = { label: path.basename(found.match.folderPath), path: found.match.folderPath };
+      } else if (found.type === 'ambiguous') {
+        const options = found.matches.slice(0, 5)
+          .map((m) => `"${m.file.name}" in ${path.basename(m.folderPath)}`).join(', ');
+        return {
+          reply: `I found multiple matches: ${options}. Which one did you want to move?`,
+          intent: { type: INTENT.CHAT, query: null, source: null, destination: destination?.label || null, folderHint: null },
+        };
+      }
+    }
+    if (!source) {
+      return {
+        reply: 'I need to know which folder to move the file from. Could you tell me where it is?',
+        intent: { type: INTENT.CHAT, query: null, source: null, destination: destination?.label || null, folderHint: null },
+      };
+    }
+  }
+
+  if (!destination) {
     return {
-      reply: 'I need both a source and destination folder before I can prepare a move plan.',
-      intent: { type: INTENT.CHAT, query: null, source: null, destination: null, folderHint: null },
+      reply: 'I need to know which folder to move the file to. Where would you like it moved?',
+      intent: { type: INTENT.CHAT, query: null, source: source.label, destination: null, folderHint: source.label },
     };
   }
 
-  const sourceExists = await ensureFolderExists(source.path);
+  // Handle subfolder paths like "Downloads/Images" — try home-relative resolution
+  let sourceExists = await ensureFolderExists(source.path);
+  if (!sourceExists) {
+    const homeBased = path.join(os.homedir(), intent.source || intent.folderHint || '');
+    if (await ensureFolderExists(homeBased)) {
+      source = { label: path.basename(homeBased), path: homeBased };
+      sourceExists = true;
+    }
+  }
+
   if (!sourceExists) {
     return {
-      reply: `I could not find the source folder \"${source.label}\" on this device.`,
+      reply: `I could not find the source folder "${source.label}" on this device.`,
       intent: { type: INTENT.CHAT, query: null, source: source.label, destination: destination.label, folderHint: source.label },
     };
   }
@@ -868,13 +1329,64 @@ async function buildMovePlan(intent, specificFile = null) {
   };
 }
 
+// System/protected paths to skip when scanning for user files.
+// These directories throw EPERM on Windows and never contain user-owned files.
+const SYSTEM_PATH_PREFIXES = [
+  'C:\\Windows',
+  'C:\\Program Files',
+  'C:\\Program Files (x86)',
+  'C:\\ProgramData',
+  'C:\\MSOCache',
+  'C:\\System Volume Information',
+  'C:\\$Recycle.Bin',
+  'C:\\$WINDOWS.~BT',
+  'C:\\Recovery',
+  'C:\\Boot',
+  'C:\\Config.Msi',
+  'C:\\Documents and Settings',
+];
+
+function isSystemPath(folderPath) {
+  const normalized = path.resolve(folderPath).toLowerCase();
+  // Skip drive roots (C:\, D:\, etc.) — too broad and causes EPERM
+  if (/^[a-z]:\\?$/i.test(normalized)) return true;
+  // Skip known system directories
+  return SYSTEM_PATH_PREFIXES.some((p) => normalized.startsWith(p.toLowerCase()));
+}
+
 async function findSingleFileAcrossDefaultFolders(fileHint) {
   const defaults = getDefaultFolders();
   const matches = [];
+
+  // Build list of folders to search: top-level defaults + their immediate subdirectories
+  const foldersToSearch = [];
   for (const folderPath of Object.values(defaults)) {
+    if (isSystemPath(folderPath)) continue;
     const exists = await ensureFolderExists(folderPath);
     if (!exists) continue;
-    const files = await listDirectFiles(folderPath);
+    foldersToSearch.push(folderPath);
+    // Also search one level deep (e.g. Downloads/Images, Downloads/Documents, etc.)
+    try {
+      const dirents = await fs.readdir(folderPath, { withFileTypes: true });
+      for (const d of dirents) {
+        if (d.isDirectory()) {
+          const subPath = path.join(folderPath, d.name);
+          if (!isSystemPath(subPath)) {
+            foldersToSearch.push(subPath);
+          }
+        }
+      }
+    } catch { /* skip unreadable */ }
+  }
+
+  for (const folderPath of foldersToSearch) {
+    if (isSystemPath(folderPath)) continue;
+    const exists = await ensureFolderExists(folderPath);
+    if (!exists) continue;
+    let files;
+    try {
+      files = await listDirectFiles(folderPath);
+    } catch { /* skip permission-denied folders */ continue; }
     const picked = selectFilesByHint(files, fileHint);
     if (picked.type === 'single' && picked.files[0]) {
       matches.push({ folderPath, file: picked.files[0] });
@@ -1123,21 +1635,78 @@ async function buildCreateFolderPlan(message, intent) {
 
 function extractFolderFromMessage(message, role = null) {
   const t = message.toLowerCase();
-  // Check each known folder alias
-  for (const [alias, canonical] of Object.entries(FOLDER_ALIASES)) {
-    if (t.includes(alias)) {
-      if (role === 'destination') {
-        // Only return as destination if preceded by "to"
-        const re = new RegExp(`\\bto\\b.*\\b${alias}\\b`, 'i');
-        if (re.test(t)) return canonical;
-      } else if (role === 'source') {
-        // Only return as source if preceded by "from" or "in"
-        const re = new RegExp(`\\b(from|in)\\b.*\\b${alias}\\b`, 'i');
-        if (re.test(t)) return canonical;
-      } else {
-        return canonical;
-      }
+
+  // First try to match explicit subfolder paths like "Downloads/Images" or "Downloads\Images"
+  // Only match when the path segment appears right after from/in/to.
+  const subpathPattern = /(?<=\b(?:from|in|to)\s+)([a-z][a-z0-9_\-]*)[/\\]([a-z0-9_\-]+)/gi;
+  let subMatch;
+  while ((subMatch = subpathPattern.exec(t)) !== null) {
+    const segment0 = subMatch[1].trim().toLowerCase();
+    const fullPath = subMatch[0].trim();
+    const topAlias = FOLDER_ALIASES[segment0];
+    const defaults = getDefaultFolders();
+    const topDefaultKey = topAlias
+      ? topAlias
+      : Object.keys(defaults).find((k) => k.toLowerCase() === segment0);
+    if (topDefaultKey) {
+      // Determine which preposition preceded this path
+      const matchStart = subMatch.index;
+      const preceding = t.substring(0, matchStart);
+      const isAfterTo   = /\bto\s+$/.test(preceding);
+      const isAfterFrom = /\b(?:from|in)\s+$/.test(preceding);
+      if (role === 'destination' && isAfterTo)   return fullPath;
+      if (role === 'source'      && isAfterFrom) return fullPath;
+      if (!role) return fullPath;
     }
+  }
+
+  // ── Top-level folder aliases ─────────────────────────────────────────────
+  // KEY FIX: The old regex `\b(from|in)\b.*\balias\b` was too greedy.
+  // For "move the aizen image from downloads to desktop", it matched "desktop"
+  // as the SOURCE because "from" appears before "desktop" anywhere in the string.
+  //
+  // Correct approach: split the message at the word "to":
+  //   • source  = alias found after "from/in" in the part BEFORE the last " to "
+  //   • destination = alias found after "to" in the part AFTER "to"
+  // This prevents the destination folder from being mistakenly identified as source.
+
+  if (role === 'source') {
+    // Only search in the substring from "from/in" up to the last " to "
+    const toIdx = t.lastIndexOf(' to ');
+    const searchIn = toIdx >= 0 ? t.substring(0, toIdx) : t;
+    const fromMatch = searchIn.match(/\b(?:from|in)\s+(.+)$/i);
+    if (!fromMatch) return null;
+    const afterPrep = fromMatch[1];
+    for (const [alias, canonical] of Object.entries(FOLDER_ALIASES)) {
+      if (alias.length < 2) continue;
+      const idx = afterPrep.toLowerCase().indexOf(alias);
+      if (idx === -1) continue;
+      const charBefore = idx > 0 ? afterPrep[idx - 1] : ' ';
+      const charAfter  = idx + alias.length < afterPrep.length ? afterPrep[idx + alias.length] : ' ';
+      if (!/[a-z0-9]/.test(charBefore) && !/[a-z0-9]/.test(charAfter)) return canonical;
+    }
+    return null;
+  }
+
+  if (role === 'destination') {
+    // Only search in the substring after the last "to "
+    const toMatch = t.match(/\bto\s+(.+)$/i);
+    if (!toMatch) return null;
+    const afterTo = toMatch[1];
+    for (const [alias, canonical] of Object.entries(FOLDER_ALIASES)) {
+      if (alias.length < 2) continue;
+      const idx = afterTo.toLowerCase().indexOf(alias);
+      if (idx === -1) continue;
+      const charBefore = idx > 0 ? afterTo[idx - 1] : ' ';
+      const charAfter  = idx + alias.length < afterTo.length ? afterTo[idx + alias.length] : ' ';
+      if (!/[a-z0-9]/.test(charBefore) && !/[a-z0-9]/.test(charAfter)) return canonical;
+    }
+    return null;
+  }
+
+  // No role — return first matching alias anywhere in message
+  for (const [alias, canonical] of Object.entries(FOLDER_ALIASES)) {
+    if (t.includes(alias)) return canonical;
   }
   return null;
 }
@@ -1248,6 +1817,9 @@ async function buildScanSuggestionPlan(scanPath, scanLabel) {
 /**
  * Handle scan_structure intent: scan the target folder(s) and build a real
  * suggestion plan, or report that no files need organising.
+ *
+ * @param {object}      intent      Parsed intent from the IBM agent
+ * @param {string|null} agentReply  The IBM agent's original text reply (used as fallback)
  */
 async function handleScanStructureIntent(intent, agentReply) {
   // Determine which folder to scan
@@ -1271,8 +1843,12 @@ async function handleScanStructureIntent(intent, agentReply) {
 
   if (allPlans.length === 0) {
     const label = resolved ? resolved.label : 'your watched folders';
+    // Use IBM agent reply when available — it may contain more context (e.g. for C:\ drive scans)
+    const fallbackMsg = agentReply && agentReply.trim()
+      ? agentReply.trim()
+      : `**${label}** already looks organised — all files are in their own subfolders or there are no loose files to move at the root level.`;
     return {
-      reply: `**${label}** already looks organised — all files are in their own subfolders or there are no loose files to move.`,
+      reply: fallbackMsg,
       intent: { type: INTENT.SCAN_STRUCTURE, query: null, source: folderRef, destination: null, folderHint: folderRef },
     };
   }
@@ -1326,7 +1902,7 @@ async function handleScanStructureIntent(intent, agentReply) {
 async function buildFolderCountReply(intent, agentReply = null) {
   const folder = resolveFolderRef(intent.source || intent.folderHint);
   if (!folder) {
-    // Return agent's plain-text reply as-is — it was already conversational
+    // Use the IBM agent's reply — it already answered the question with live file context
     return {
       reply: agentReply || 'I could not tell which folder you meant. Try something like "how many files are in Downloads?"',
       intent: { type: INTENT.CHAT, query: null, source: null, destination: null, folderHint: null },
@@ -1336,7 +1912,7 @@ async function buildFolderCountReply(intent, agentReply = null) {
   const exists = await ensureFolderExists(folder.path);
   if (!exists) {
     return {
-      reply: `I could not find the **${folder.label}** folder on this device.`,
+      reply: agentReply || `I could not find the **${folder.label}** folder on this device.`,
       intent: { type: INTENT.CHAT, query: null, source: folder.label, destination: null, folderHint: folder.label },
     };
   }
@@ -1502,12 +2078,16 @@ async function processChatMessage(message, incomingThreadId = null) {
   let normalized;
 
   // Extract a specific filename from the message early — used for move/delete filtering
-  const specificFile = extractSpecificFile(message);
+  // Also extract the folder hint if the user specified a path like "Downloads/Images/aizen.jpg"
+  const { filename: specificFile, folderRef: specificFileFolderRef } = extractSpecificFileWithFolder(message);
 
   try {
     const rawResponse = await askOrchestrate(message, incomingThreadId);
     const rawText = extractAssistantText(rawResponse);
-    normalized = normalizeIntent(rawText);
+    // Pass the original user message so when the agent ignores the JSON format
+    // instruction and replies in plain text, intent is inferred from the user's
+    // words (reliable) not the agent's verbose refusal (unreliable).
+    normalized = normalizeIntent(rawText, message);
     // Attach the thread ID so the client can send it back next turn
     normalized.threadId = rawResponse?.thread_id || threadId || null;
   } catch (err) {
@@ -1516,15 +2096,141 @@ async function processChatMessage(message, incomingThreadId = null) {
   }
 
   // ── Smart delete detection ────────────────────────────────────────────────
-  // If message mentions delete/remove/trash + a specific file, build a delete plan
+  // Handles: "delete aizen.jpg", "delete it", "delete the exe files",
+  //          "delete exe which are not required", "remove them", etc.
   const msgHasDelete = /\b(delete|remove|trash|erase)\b/i.test(message);
-  if (msgHasDelete && specificFile) {
-    const srcFromMsg = extractFolderFromMessage(message, 'source') || extractFolderFromMessage(message);
-    if (srcFromMsg) {
+  const isPronounRef = /\b(it|them|this|that|those|these|the\s+file|the\s+image|the\s+video|the\s+document)\b/i.test(message);
+
+  // Detect extension-based delete: "delete the exe files", "delete all zip files", etc.
+  const extDeleteMatch = message.match(/\bdelete\b.*?\b(exe|zip|rar|msi|pdf|jpg|jpeg|png|mp4|mp3|docx?|xlsx?|txt|iso|dmg|apk|jar|gz|tar|7z)\b/i)
+    || message.match(/\b(exe|zip|rar|msi|pdf|jpg|jpeg|png|mp4|mp3|docx?|xlsx?|txt|iso|dmg|apk|jar|gz|tar|7z)\b.*?\bdelete\b/i);
+  const extToDelete = extDeleteMatch ? extDeleteMatch[1].toLowerCase() : null;
+
+  if (msgHasDelete) {
+    // ── Case A: specific named file ───────────────────────────────────────
+    if (specificFile) {
+      // If user gave a path reference like "Downloads/Images/aizen.jpg",
+      // use the extracted folder path as the source (overrides everything else)
+      const srcFromPath = specificFileFolderRef
+        ? specificFileFolderRef
+        : null;
+      const srcFromMsg = srcFromPath
+        || extractFolderFromMessage(message, 'source')
+        || extractFolderFromMessage(message)
+        || normalizeTextField(normalized.intent.source)
+        || normalizeTextField(normalized.intent.folderHint);
       normalized.intent.type = INTENT.DELETE_FILE;
-      normalized.intent.source = srcFromMsg;
+      normalized.intent.source = srcFromMsg || normalized.intent.source || normalized.intent.folderHint || 'Downloads';
       normalized.intent.query = specificFile;
     }
+    // ── Case B: extension-based delete ("delete the exe files") ──────────
+    else if (extToDelete) {
+      // Find all files of that extension across thread context or default folders
+      const threadCtx = incomingThreadId ? getThreadFileContext(incomingThreadId) : null;
+      const searchFolders = threadCtx
+        ? [{ label: threadCtx.folder, path: path.dirname(threadCtx.files[0]?.sourcePath || '') }]
+        : await getWatchedFolders().then((paths) => paths.map((p) => ({ label: path.basename(p), path: p })));
+
+      const matchedFiles = [];
+      for (const folder of searchFolders) {
+        const exists = await ensureFolderExists(folder.path);
+        if (!exists) continue;
+        const files = await listDirectFiles(folder.path);
+        const byExt = files.filter((f) => path.extname(f.name).toLowerCase() === `.${extToDelete}`);
+        for (const f of byExt) matchedFiles.push({ ...f, folderLabel: folder.label });
+      }
+
+      if (matchedFiles.length > 0) {
+        const trashDir = path.join(os.homedir(), '.SmartDesk', 'Trash');
+        const planId = crypto.randomUUID();
+        const existingNames = new Set();
+        const items = matchedFiles.map((file) => ({
+          operation: 'delete',
+          name: file.name,
+          sourcePath: file.sourcePath,
+          targetPath: createUniqueTarget(path.join(trashDir, file.name), existingNames),
+          newName: null,
+          sizeBytes: file.sizeBytes ?? null,
+        }));
+        const plan = {
+          id: planId,
+          type: INTENT.DELETE_FILE,
+          title: `Delete ${items.length} .${extToDelete} file${items.length === 1 ? '' : 's'}`,
+          detail: 'Files will be moved to ~/.SmartDesk/Trash/ and can be recovered.',
+          sourceLabel: matchedFiles[0].folderLabel,
+          destinationLabel: 'SmartDesk Trash',
+          sourcePath: path.dirname(matchedFiles[0].sourcePath),
+          destinationPath: trashDir,
+          count: items.length,
+          items,
+          createdAt: new Date().toISOString(),
+        };
+        planStore.set(planId, plan);
+        return {
+          reply: normalized.reply ||
+            `I found **${items.length} .${extToDelete} file${items.length === 1 ? '' : 's'}** that can be deleted. They will be moved to SmartDesk Trash (recoverable). Review the plan below and approve to proceed.`,
+          intent: {
+            type: INTENT.DELETE_FILE,
+            query: `.${extToDelete}`,
+            source: matchedFiles[0].folderLabel,
+            destination: 'SmartDesk Trash',
+            folderHint: matchedFiles[0].folderLabel,
+            approvalPlan: plan,
+          },
+          threadId: normalized.threadId,
+        };
+      }
+      // No files found — let IBM reply flow through (it may have context we don't)
+    }
+    // ── Case C: pronoun reference ("delete it", "delete them") ────────────
+    else if (isPronounRef && incomingThreadId) {
+      const ctx = getThreadFileContext(incomingThreadId);
+      if (ctx && ctx.files && ctx.files.length > 0) {
+        const trashDir = path.join(os.homedir(), '.SmartDesk', 'Trash');
+        const planId = crypto.randomUUID();
+        const existingNames = new Set();
+        const items = ctx.files.map((file) => ({
+          operation: 'delete',
+          name: file.name,
+          sourcePath: file.sourcePath,
+          targetPath: createUniqueTarget(path.join(trashDir, file.name), existingNames),
+          newName: null,
+          sizeBytes: file.sizeBytes ?? null,
+        }));
+        const plan = {
+          id: planId,
+          type: INTENT.DELETE_FILE,
+          title: items.length === 1
+            ? `Delete "${items[0].name}" from ${ctx.folder}`
+            : `Delete ${items.length} files from ${ctx.folder}`,
+          detail: 'Files will be moved to ~/.SmartDesk/Trash/ and can be recovered.',
+          sourceLabel: ctx.folder,
+          destinationLabel: 'SmartDesk Trash',
+          sourcePath: path.dirname(ctx.files[0].sourcePath),
+          destinationPath: trashDir,
+          count: items.length,
+          items,
+          createdAt: new Date().toISOString(),
+        };
+        planStore.set(planId, plan);
+        return {
+          reply: normalized.reply || (items.length === 1
+            ? `I prepared a plan to delete **"${items[0].name}"** from ${ctx.folder}. It will be moved to SmartDesk Trash (recoverable). Review and approve to proceed.`
+            : `I prepared a plan to delete **${items.length} files** from ${ctx.folder}. They will be moved to SmartDesk Trash (recoverable). Review and approve to proceed.`),
+          intent: {
+            type: INTENT.DELETE_FILE,
+            query: items[0].name,
+            source: ctx.folder,
+            destination: 'SmartDesk Trash',
+            folderHint: ctx.folder,
+            approvalPlan: plan,
+          },
+          threadId: normalized.threadId,
+        };
+      }
+    }
+    // ── Case D: IBM returned delete_file intent directly — trust it ───────
+    // (falls through to buildDeletePlan below)
   }
 
   // ── Smart create-folder detection ──────────────────────────────────────────
@@ -1535,18 +2241,30 @@ async function processChatMessage(message, incomingThreadId = null) {
     normalized.intent.query = createFolderReq.fileHint || createFolderReq.folderName;
   }
 
-  // ── Smart scan/organize-structure detection (guard against misclassified create_folder) ──
-  const msgWantsStructureScan =
-    /\b(scan|analyse?|analyze|check|review|suggest)\b.*\b(folder|structure|system|files?)\b/i.test(message) ||
-    (/\b(organis|organiz|clean\s*up|reorganis|reorganiz)\b/i.test(message) &&
-     /\b(folder|desktop|downloads?|documents?|pictures?|videos?|files?)\b/i.test(message) &&
-     !/\b(create|make)\b.*\bfolder\b/i.test(message));
+  // ── Smart scan/organize-structure detection ────────────────────────────────
+  // Only force SCAN_STRUCTURE when the user explicitly asks to *organise/clean*
+  // a folder's structure — NOT when they're asking for information (sizes, counts,
+  // listings). Informational queries like "scan each folder and give me the size"
+  // should be answered by the IBM agent as a chat/count reply, not diverted into
+  // an organise plan.
+  //
+  // Informational signals (block the override when any of these appear):
+  //   - "size", "how big", "how much space", "give me", "show me", "list",
+  //     "how many", "count", "what is in", "what's in", "tell me"
+  const isInformationalQuery =
+    /\b(size|sizes|how\s+big|how\s+much\s+space|how\s+much\s+storage|give\s+me|show\s+me|show\s+the|list|how\s+many|count\s+the|what\s+is\s+in|what'?s\s+in|tell\s+me|report|overview|summary|details?)\b/i.test(message);
 
-  if (msgWantsStructureScan) {
+  const msgExplicitScan =
+    !isInformationalQuery &&
+    /\b(scan|analyse?|analyze|review|suggest)\b.*\b(folder|structure|system|files?)\b/i.test(message);
+
+  if (msgExplicitScan) {
     const hint = extractFolderFromMessage(message);
     normalized.intent.type = INTENT.SCAN_STRUCTURE;
-    normalized.intent.folderHint = hint;
-    normalized.intent.source = hint;
+    if (hint) {
+      normalized.intent.folderHint = hint;
+      normalized.intent.source = hint;
+    }
   }
 
   // ── Smart move-folder detection ────────────────────────────────────────────
@@ -1569,14 +2287,75 @@ async function processChatMessage(message, incomingThreadId = null) {
   // a move plan — regardless of what intent the agent returned. This handles
   // cases where the agent says "I'm ready but need confirmation" instead of
   // returning move_files intent.
-  const msgHasMove = /\bmove\b/i.test(message) && !/\bmove\b.*\bfolder\b/i.test(message);
+  // Also detect "from X to Y" shorthand where user omits the word "move"
+  // e.g. "from downloads to desktop", "from Downloads/Images to Desktop"
+  const msgHasMove = (
+    (/\bmove\b/i.test(message) && !/\bmove\b.*\bfolder\b/i.test(message)) ||
+    (/\bfrom\b.+\bto\b/i.test(message) && !msgHasDelete)
+  );
   const srcFromMsg = extractFolderFromMessage(message, 'source');
   const dstFromMsg = extractFolderFromMessage(message, 'destination');
+
+  // Pronoun move: "move it to Downloads", "move it to Documents"
+  const moveIsPronounRef = msgHasMove && isPronounRef && dstFromMsg && incomingThreadId;
+  if (moveIsPronounRef) {
+    const ctx = getThreadFileContext(incomingThreadId);
+    if (ctx && ctx.files && ctx.files.length > 0) {
+      const dst = resolveFolderRef(dstFromMsg);
+      if (dst) {
+        const planId = crypto.randomUUID();
+        const existingNames = new Set();
+        const items = ctx.files.map((file) => ({
+          operation: 'move',
+          name: file.name,
+          sourcePath: file.sourcePath,
+          targetPath: createUniqueTarget(path.join(dst.path, file.name), existingNames),
+          newName: null,
+          sizeBytes: file.sizeBytes ?? null,
+        }));
+        const plan = {
+          id: planId,
+          type: INTENT.MOVE_FILES,
+          title: items.length === 1
+            ? `Move "${items[0].name}" from ${ctx.folder} to ${dst.label}`
+            : `Move ${items.length} files from ${ctx.folder} to ${dst.label}`,
+          detail: 'Nothing will be moved until you approve this plan.',
+          sourceLabel: ctx.folder,
+          destinationLabel: dst.label,
+          sourcePath: path.dirname(ctx.files[0].sourcePath),
+          destinationPath: dst.path,
+          count: items.length,
+          items,
+          createdAt: new Date().toISOString(),
+        };
+        planStore.set(planId, plan);
+        return {
+          reply: items.length === 1
+            ? `I prepared a plan to move **"${items[0].name}"** from ${ctx.folder} to ${dst.label}. Review and approve to proceed.`
+            : `I prepared a plan to move **${items.length} files** from ${ctx.folder} to ${dst.label}. Review and approve to proceed.`,
+          intent: {
+            type: INTENT.MOVE_FILES,
+            query: null,
+            source: ctx.folder,
+            destination: dst.label,
+            folderHint: ctx.folder,
+            approvalPlan: plan,
+          },
+          threadId: normalized.threadId,
+        };
+      }
+    }
+  }
 
   if (msgHasMove && srcFromMsg && dstFromMsg) {
     normalized.intent.type        = INTENT.MOVE_FILES;
     normalized.intent.source      = srcFromMsg;
     normalized.intent.destination = dstFromMsg;
+  } else if (msgHasMove && !srcFromMsg && dstFromMsg && normalized.intent.type !== INTENT.MOVE_FILES) {
+    // Only destination known ("move it/that to Downloads") — let buildMovePlan search for source
+    normalized.intent.type        = INTENT.MOVE_FILES;
+    normalized.intent.destination = dstFromMsg;
+    // don't set source — buildMovePlan will search using file hint / thread context
   }
 
   // ── Handle delete_file intent ─────────────────────────────────────────────
@@ -1613,7 +2392,35 @@ async function processChatMessage(message, incomingThreadId = null) {
   if (isMoveIntent) {
     if (!normalized.intent.source) normalized.intent.source = srcFromMsg;
     if (!normalized.intent.destination) normalized.intent.destination = dstFromMsg;
-    const result = await buildMovePlan(normalized.intent, specificFile);
+    // If source still missing but IBM's reply or query mentions a file,
+    // pass it as specificFile so buildMovePlan can search for it
+    const moveFileHint = specificFile
+      || normalizeTextField(normalized.intent.query)
+      || extractSpecificFile(normalized.reply || '');
+    const result = await buildMovePlan(normalized.intent, moveFileHint);
+    result.threadId = normalized.threadId;
+    return result;
+  }
+
+  // ── organize_folder with only a source (no destination) → run scan plan ──
+  // "Clean Desktop", "Organise Downloads", "Tidy up my Documents" etc.
+  // The IBM agent says organise but gives no destination because it means
+  // "sort files into type-based subfolders inside that folder".
+  // Guard: do NOT run a scan plan when the user was asking for information
+  // (sizes, counts, listings) — the IBM reply is already correct in that case.
+  if (normalized.intent.type === INTENT.ORGANIZE_FOLDER && !isInformationalQuery) {
+    const folderHint = normalized.intent.source || normalized.intent.folderHint
+      || extractFolderFromMessage(message);
+    const result = await handleScanStructureIntent(
+      {
+        type:       INTENT.SCAN_STRUCTURE,
+        folderHint: folderHint || null,
+        source:     folderHint || null,
+        query:      null,
+        destination: null,
+      },
+      normalized.reply,  // pass IBM reply so empty folders use it instead of a canned string
+    );
     result.threadId = normalized.threadId;
     return result;
   }
@@ -1639,6 +2446,58 @@ async function processChatMessage(message, incomingThreadId = null) {
     const result = await handleScanStructureIntent(normalized.intent, normalized.reply);
     result.threadId = normalized.threadId;
     return result;
+  }
+
+  // ── Store thread file context for find_file / chat results ──────────────
+  // When the agent answers a find/search/list query, store the found file(s)
+  // so follow-up "delete it" / "move it" / "delete them" commands work.
+  if (
+    normalized.threadId &&
+    (normalized.intent.type === INTENT.FIND_FILE || normalized.intent.type === INTENT.CHAT)
+  ) {
+    const fileHint = normalizeTextField(normalized.intent.query || specificFile);
+    const folderRef = normalized.intent.folderHint || normalized.intent.source;
+
+    // Also detect if the message asked about a specific extension type
+    const extMentioned = message.match(/\b(exe|zip|rar|msi|pdf|jpg|jpeg|png|mp4|mp3|docx?|xlsx?|txt|iso|dmg|apk|jar|gz|tar|7z)\b/i);
+    const extHint = extMentioned ? extMentioned[1].toLowerCase() : null;
+
+    if (fileHint || extHint) {
+      const folder = folderRef ? resolveFolderRef(folderRef) : null;
+      const searchPaths = folder
+        ? [{ label: folder.label, path: folder.path }]
+        : await getWatchedFolders().then((paths) =>
+            paths.map((p) => ({ label: path.basename(p), path: p }))
+          );
+
+      const matches = [];
+      for (const fp of searchPaths) {
+        const exists = await ensureFolderExists(fp.path);
+        if (!exists) continue;
+        const files = await listDirectFiles(fp.path);
+
+        if (extHint) {
+          // Filter by extension
+          const byExt = files.filter((f) => path.extname(f.name).toLowerCase() === `.${extHint}`);
+          for (const f of byExt) matches.push({ ...f, folderPath: fp.path, folderLabel: fp.label });
+        } else if (fileHint) {
+          const picked = selectFilesByHint(files, fileHint);
+          if (picked.type === 'single' && picked.files[0]) {
+            matches.push({ ...picked.files[0], folderPath: fp.path, folderLabel: fp.label });
+          } else if (picked.type === 'ambiguous') {
+            for (const f of picked.files) matches.push({ ...f, folderPath: fp.path, folderLabel: fp.label });
+          }
+        }
+        if (matches.length >= 20) break; // cap at 20 to avoid storing huge lists
+      }
+
+      if (matches.length > 0) {
+        const folderLabel = folder?.label
+          || (matches[0].folderLabel)
+          || path.basename(matches[0].folderPath || '');
+        storeThreadFileContext(normalized.threadId, matches, folderLabel);
+      }
+    }
   }
 
   return normalized;

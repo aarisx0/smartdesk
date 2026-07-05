@@ -48,22 +48,42 @@ let splashWindow: BrowserWindow | null = null;
 
 function createSplashWindow(): BrowserWindow {
   splashWindow = new BrowserWindow({
-    width:           440,
-    height:          300,
+    width:           480,
+    height:          320,
     frame:           false,
-    transparent:     true,
+    transparent:     false,
+    backgroundColor: '#0F0F1A',  // matches HTML body — no blank flash
     resizable:       false,
     center:          true,
-    skipTaskbar:     true,
+    skipTaskbar:     false,
     alwaysOnTop:     true,
+    show:            false,       // defer show until ready-to-show
     webPreferences: {
       contextIsolation: true,
       nodeIntegration:  false,
     },
   });
 
-  splashWindow.loadFile(path.join(__dirname, 'splash.html'));
-  splashWindow.once('ready-to-show', () => splashWindow?.show());
+  const fsp = require('fs');
+  const distSplash = path.join(__dirname, 'splash.html');
+  const srcSplash  = path.join(__dirname, '../../src/main/splash.html');
+  const splashPath = fsp.existsSync(distSplash) ? distSplash : srcSplash;
+  console.log('[splash] loading from:', splashPath, '| exists:', fsp.existsSync(splashPath));
+
+  splashWindow.loadFile(splashPath);
+
+  // Show as soon as content is painted — prevents blank flash.
+  // Fallback: show after 400 ms regardless so users aren't stuck on nothing.
+  let shown = false;
+  const showSplash = () => {
+    if (shown) return;
+    shown = true;
+    if (splashWindow && !splashWindow.isDestroyed()) splashWindow.show();
+  };
+
+  splashWindow.once('ready-to-show', showSplash);
+  setTimeout(showSplash, 400);   // guaranteed fallback
+
   return splashWindow;
 }
 
@@ -215,8 +235,8 @@ async function bootstrap(): Promise<void> {
     savedFolders,
   );
 
-  // 6. Show main window after a short splash (1.5s feels natural)
-  setTimeout(showMainWindow, 1_500);
+  // 6. Show main window after a comfortable splash (3.5s — long enough to read and animate)
+  setTimeout(showMainWindow, 3_500);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
