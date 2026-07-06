@@ -62,6 +62,7 @@ const INTENT = {
   CREATE_FOLDER: 'create_folder',
   MOVE_FOLDER: 'move_folder',
   FIND_FILE: 'find_file',
+  OPEN_FILE: 'open_file',
   SHOW_DUPLICATES: 'show_duplicates',
   STORAGE_REPORT: 'storage_report',
   SCAN_STRUCTURE: 'scan_structure',
@@ -872,28 +873,28 @@ function createUniqueTarget(basePath, existingNames) {
 function extractSpecificFile(message) {
   // Match quoted filenames: "resume.pdf" or 'resume.pdf'
   const quoted = message.match(/["']([^"']+\.[a-z0-9]+)["']/i);
-  if (quoted) return path.basename(quoted[1]); // strip any path prefix from quoted names
+  if (quoted) return path.basename(quoted[1]);
 
   // Match path-like references: Downloads/Images/aizen.jpg or Downloads\Images\aizen.jpg
-  // This handles "delete the Downloads/Images/aizen.jpg" style messages
   const pathRef = message.match(/\b([A-Za-z][A-Za-z0-9_\s\-]*[/\\][A-Za-z0-9_\s/\\\-\.]+\.(pdf|docx?|txt|jpg|jpeg|png|mp4|mp3|exe|msi|zip|rar|csv|xlsx?|iso|dmg|deb|rpm|7z|tar|gz|apk|jar))\b/i);
   if (pathRef) return path.basename(pathRef[1]);
 
   // Match "file named X" or "file called X" or "named X" or "called X"
   const named = message.match(/(?:file\s+(?:named|called)\s+|named\s+|called\s+)([^\s,]+\.[a-z0-9]+)/i);
   if (named) return named[1];
-  // Match filename patterns — must NOT start with a command verb
-  // Pattern: one or more words (no leading verb) followed by .extension
-  // Strip leading action verbs first
+
+  // Strip leading action verbs and leading articles (the/a/an/my) so
+  // "move the 12.jpg from downloads" → stripped = "12.jpg"
   const stripped = message
     .replace(/^\s*(?:move|delete|remove|trash|copy|rename|find|open)\s+/i, '')
+    .replace(/^(?:the|a|an|my)\s+/i, '')          // strip leading article
     .replace(/\b(?:from|to|in|at|into)\b.*/i, '')
     .trim();
   const filePattern = stripped.match(/^([a-zA-Z0-9_\s\-\.]+\.(pdf|docx?|txt|jpg|jpeg|png|mp4|mp3|exe|msi|zip|rar|csv|xlsx?|iso|dmg|deb|rpm|7z|tar|gz|apk|jar))\s*$/i);
   if (filePattern) return filePattern[1].trim();
-  // Match natural language file hints without extension:
-  // "move resume file from Desktop to Downloads", "delete the invoice from Documents"
-  const natural = message.match(/\b(?:move|delete|remove|trash|rename)\s+(?:the\s+|my\s+|a\s+|an\s+)?(.+?)\s+(?:from|to|in|into)\b/i);
+
+  // Natural language hints: "move the 12.jpg from downloads to desktop"
+  const natural = message.match(/\b(?:move|delete|remove|trash|rename|open)\s+(?:the\s+|my\s+|a\s+|an\s+)?(.+?)\s+(?:from|to|in|into)\b/i);
   if (natural) {
     const hint = natural[1]
       .replace(/\b(files?|folder)\b/ig, ' ')
@@ -1268,17 +1269,69 @@ async function buildMovePlan(intent, specificFile = null) {
   const fileHint = normalizeTextField(specificFile || intent.query);
   let filesToMove = files;
   if (fileHint) {
-    const picked = selectFilesByHint(files, fileHint);
+    let picked = selectFilesByHint(files, fileHint);
+
+    // File not found at the stated source root — search subdirectories of that
+    // folder, then all default folders (including their subdirs).
+    // This handles "move 12.jpg from downloads to desktop" when 12.jpg is in
+    // downloads/images — the user doesn't need to know the exact subfolder.
     if (picked.type === 'none') {
-      return {
-        reply: `I could not find "${fileHint}" in ${source.label}.`,
-        intent: { type: INTENT.CHAT, query: null, source: source.label, destination: destination.label, folderHint: source.label },
-      };
+      // 1. Search one level deep inside the stated source folder
+      let deepFiles = [];
+      try {
+        const dirents = await fs.readdir(source.path, { withFileTypes: true });
+        for (const d of dirents) {
+          if (!d.isDirectory()) continue;
+          const subPath = path.join(source.path, d.name);
+          try {
+            const subFiles = await listDirectFiles(subPath);
+            const subPicked = selectFilesByHint(subFiles, fileHint);
+            if (subPicked.type !== 'none') {
+              deepFiles.push({ folderPath: subPath, files: subPicked.files, type: subPicked.type });
+            }
+          } catch { /* skip */ }
+        }
+      } catch { /* skip */ }
+
+      if (deepFiles.length === 1 && deepFiles[0].type === 'single') {
+        // Found exactly once in a subfolder — use it
+        const hit = deepFiles[0];
+        source = { label: `${source.label}/${path.basename(hit.folderPath)}`, path: hit.folderPath };
+        filesToMove = hit.files;
+        picked = { type: 'single', files: hit.files };
+      } else if (deepFiles.length > 1 || (deepFiles.length === 1 && deepFiles[0].type === 'ambiguous')) {
+        const allHits = deepFiles.flatMap((d) => d.files.map((f) => `"${f.name}" in ${path.basename(d.folderPath)}`));
+        return {
+          reply: `I found multiple matches for "${fileHint}": ${allHits.slice(0, 5).join(', ')}. Which one did you mean?`,
+          intent: { type: INTENT.CHAT, query: null, source: source.label, destination: destination.label, folderHint: source.label },
+        };
+      } else {
+        // 2. Not in source or its subdirs — search ALL default folders (with subdirs)
+        const found = await findSingleFileAcrossDefaultFolders(fileHint);
+        if (found.type === 'single' && found.match) {
+          source = { label: found.match.folderPath, path: found.match.folderPath };
+          filesToMove = [found.match.file];
+          picked = { type: 'single', files: filesToMove };
+        } else if (found.type === 'ambiguous') {
+          const options = found.matches.slice(0, 5)
+            .map((m) => `"${m.file.name}" in ${path.basename(m.folderPath)}`).join(', ');
+          return {
+            reply: `I found "${fileHint}" in multiple places: ${options}. Which one did you want to move?`,
+            intent: { type: INTENT.CHAT, query: null, source: null, destination: destination.label, folderHint: null },
+          };
+        } else {
+          return {
+            reply: `I searched everywhere but could not find "${fileHint}". Check the spelling or try a different name.`,
+            intent: { type: INTENT.CHAT, query: null, source: source.label, destination: destination.label, folderHint: source.label },
+          };
+        }
+      }
     }
+
     if (picked.type === 'ambiguous') {
       const options = picked.files.slice(0, 5).map((f) => `"${f.name}"`).join(', ');
       return {
-        reply: `I found multiple matches for "${fileHint}" in ${source.label}: ${options}. Please tell me the exact file name to move.`,
+        reply: `I found multiple matches for "${fileHint}" in ${source.label}: ${options}. Please tell me the exact file name.`,
         intent: { type: INTENT.CHAT, query: null, source: source.label, destination: destination.label, folderHint: source.label },
       };
     }
@@ -1408,10 +1461,44 @@ async function buildMoveFolderPlan(sourceFolderRef, destinationFolderRef) {
     };
   }
 
-  const sourceExists = await ensureFolderExists(source.path);
+  let sourceExists = await ensureFolderExists(source.path);
+
+  // If the folder wasn't found at the stated path, search all default folders'
+  // immediate subdirectories for a folder with that name.
+  // e.g. "move cbg15 from downloads to desktop" — cbg15 is in Downloads root
+  // or could be anywhere under the default folders.
+  if (!sourceExists) {
+    const folderName = path.basename(source.path).toLowerCase();
+    const defaults = getDefaultFolders();
+    let found = null;
+    for (const rootPath of Object.values(defaults)) {
+      if (isSystemPath(rootPath)) continue;
+      const rootExists = await ensureFolderExists(rootPath);
+      if (!rootExists) continue;
+      // Check root itself
+      const directPath = path.join(rootPath, folderName);
+      if (await ensureFolderExists(directPath)) { found = directPath; break; }
+      // Check one level deep (subfolders of default folders)
+      try {
+        const dirents = await fs.readdir(rootPath, { withFileTypes: true });
+        for (const d of dirents) {
+          if (!d.isDirectory()) continue;
+          const subPath = path.join(rootPath, d.name);
+          const candidate = path.join(subPath, folderName);
+          if (await ensureFolderExists(candidate)) { found = candidate; break; }
+        }
+      } catch { /* skip */ }
+      if (found) break;
+    }
+    if (found) {
+      source = { label: folderName, path: found };
+      sourceExists = true;
+    }
+  }
+
   if (!sourceExists) {
     return {
-      reply: `I could not find the source folder "${source.label}" on this device.`,
+      reply: `I searched but could not find a folder named "${source.label}" on this device. Check the spelling or tell me where it is.`,
       intent: { type: INTENT.CHAT, query: null, source: source.label, destination: destination.label, folderHint: source.label },
     };
   }
@@ -2077,9 +2164,31 @@ async function executePlan(planId) {
 async function processChatMessage(message, incomingThreadId = null) {
   let normalized;
 
-  // Extract a specific filename from the message early — used for move/delete filtering
+  // Extract a specific filename from the message early — used for move/delete/open filtering
   // Also extract the folder hint if the user specified a path like "Downloads/Images/aizen.jpg"
   const { filename: specificFile, folderRef: specificFileFolderRef } = extractSpecificFileWithFolder(message);
+
+  // ── Smart "open X" detection ──────────────────────────────────────────────
+  // Handles: "open 12.jpg", "open resume.pdf", "open the aizen image", etc.
+  // Bypass IBM and directly trigger find_file → if single result, auto-open.
+  const msgHasOpen = /\b(open|launch|view)\b/i.test(message);
+  if (msgHasOpen && (specificFile || /\b(open|launch|view)\s+(?:the\s+|my\s+|a\s+|an\s+)?\w+/i.test(message))) {
+    const openQuery = specificFile || extractSpecificFile(message) || message.replace(/^\s*(open|launch|view)\s+/i, '').trim();
+    if (openQuery && openQuery.length > 2) {
+      // Return a FIND_FILE intent with a flag to trigger auto-open on single match
+      return {
+        reply: `Searching for "${openQuery}"...`,
+        intent: {
+          type: INTENT.OPEN_FILE,
+          query: openQuery,
+          source: null,
+          destination: null,
+          folderHint: null,
+        },
+        threadId: incomingThreadId,
+      };
+    }
+  }
 
   try {
     const rawResponse = await askOrchestrate(message, incomingThreadId);

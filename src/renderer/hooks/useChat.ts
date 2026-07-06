@@ -323,6 +323,60 @@ export function useChat() {
     });
   }, [withTyping, push]);
 
+  /**
+   * Handle open_file intent: search for the file, then:
+   *  - 1 result  → auto-open it via the Electron shell
+   *  - >1 results → show SearchResults card so the user can pick
+   *  - 0 results  → friendly "not found" message
+   */
+  const handleOpenFile = useCallback(async (query: string) => {
+    await withTyping(async () => {
+      await delay(250);
+      try {
+        const res  = await fetch(`${API}/api/search?q=${encodeURIComponent(query)}`);
+        const resp = await res.json() as { results: SearchResultItem[]; meta: SearchMeta };
+        const results = resp.results ?? [];
+        const meta    = resp.meta ?? { query, keywords: [], extHint: null, durationMs: 0, totalFound: 0 };
+
+        if (results.length === 0) {
+          push('assistant', {
+            type: 'text',
+            text: `I searched for **"${query}"** but couldn't find any matching files in your watched folders. Try a different keyword or check Settings to make sure the folder is being watched.`,
+          });
+          return;
+        }
+
+        if (results.length === 1) {
+          // Single match — open it immediately
+          const file = results[0];
+          const openErr = await window.electronAPI?.openPath(file.filepath);
+          if (openErr) {
+            // openPath returns an empty string on success, error message on failure
+            push('assistant', {
+              type: 'text',
+              text: `Found **${file.filename}** but couldn't open it: ${openErr}`,
+            });
+          } else {
+            push('assistant', {
+              type: 'text',
+              text: `Opening **${file.filename}**…`,
+            });
+          }
+          return;
+        }
+
+        // Multiple matches — show results so user can choose
+        push('assistant', {
+          type: 'text',
+          text: `I found ${results.length} files matching **"${query}"**. Which one would you like to open?`,
+        });
+        push('assistant', { type: 'file-list', results, meta, query });
+      } catch (err) {
+        push('assistant', { type: 'error', text: `Search failed: ${(err as Error).message}` });
+      }
+    });
+  }, [withTyping, push]);
+
   const handleDuplicates = useCallback(async () => {
     await withTyping(async () => {
       await delay(400);
@@ -720,6 +774,12 @@ export function useChat() {
             break;
           }
 
+          case 'open_file': {
+            const q = sanitizeSearchQuery(intent?.query?.trim() || '');
+            if (q && q.length > 1) await handleOpenFile(q);
+            break;
+          }
+
           case 'scan_structure':
           case 'organize_folder': {
             if (intent?.approvalPlan) {
@@ -763,7 +823,7 @@ export function useChat() {
     });
   }, [
     typing, setPlan, push, withTyping, runLocalRouting,
-    handleFindFile, handleDuplicates, handlePending, handleScanStructure,
+    handleFindFile, handleOpenFile, handleDuplicates, handlePending, handleScanStructure,
     handleShowStructure,
   ]);
 
