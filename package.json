@@ -2,7 +2,7 @@
   "name": "smartdesk-ai",
   "version": "1.0.0",
   "description": "AI-powered desktop file organizer using IBM watsonx Orchestrate",
-  "main": "dist/main/index.js",
+  "main": "dist/main/bootstrap.js",
   "scripts": {
     "predev": "npx kill-port 5173 3001 --silent || true",
     "dev": "concurrently \"npm run dev:renderer\" \"npm run dev:backend\" \"npm run dev:electron\"",
@@ -11,8 +11,8 @@
     "dev:electron": "wait-on http://localhost:5173 && npm run build:main && electron .",
     "build": "npm run build:renderer && npm run build:main",
     "build:renderer": "vite build --config vite.config.ts",
-    "build:main": "tsc -p tsconfig.main.json && npm run copy:runtime",
-    "copy:runtime": "if not exist dist\\main md dist\\main & xcopy /E /I /Y src\\watcher dist\\watcher & xcopy /E /I /Y src\\db dist\\db & xcopy /E /I /Y src\\backend dist\\backend & copy /Y src\\main\\splash.html dist\\main\\splash.html",
+    "build:main": "tsc -p tsconfig.main.json && node scripts/copy-runtime.js",
+    "copy:runtime": "node scripts/copy-runtime.js",
     "copy:splash": "if not exist dist\\main md dist\\main & copy /Y src\\main\\splash.html dist\\main\\splash.html",
     "dist": "npm run build && electron-builder",
     "lint": "eslint src --ext .ts,.tsx,.js"
@@ -75,25 +75,71 @@
   "build": {
     "appId": "com.smartdesk.ai",
     "productName": "SmartDesk AI",
+    "copyright": "Copyright © 2026 SmartDesk AI",
     "directories": {
-      "output": "release"
+      "output": "release",
+      "buildResources": "assets"
     },
     "files": [
       "dist/**/*",
       "node_modules/**/*",
-      "package.json"
+      "package.json",
+      ".env.example"
+    ],
+    "asarUnpack": [
+      "dist/backend/**/*",
+      "dist/db/**/*",
+      "dist/watcher/**/*",
+      "dist/main/env-loader.js"
+    ],
+    "extraResources": [
+      {
+        "from": "assets",
+        "to": "assets",
+        "filter": ["**/*"]
+      },
+      {
+        "from": ".env",
+        "to": ".env"
+      }
     ],
     "win": {
-      "target": "nsis",
-      "icon": "assets/icon.ico"
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "assets/icon.ico",
+      "executableName": "SmartDesk AI",
+      "artifactName": "${productName}-Setup-${version}.${ext}",
+      "requestedExecutionLevel": "asInvoker"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "SmartDesk AI",
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "installerHeaderIcon": "assets/icon.ico",
+      "deleteAppDataOnUninstall": false,
+      "runAfterFinish": true,
+      "displayLanguageSelector": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "include": "build/installer.nsh"
     },
     "mac": {
       "target": "dmg",
-      "icon": "assets/icon.icns"
+      "icon": "assets/icon.icns",
+      "category": "public.app-category.productivity"
     },
     "linux": {
       "target": "AppImage",
-      "icon": "assets/icon.png"
+      "icon": "assets/icon.png",
+      "category": "Utility"
     }
   }
 }

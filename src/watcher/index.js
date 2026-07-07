@@ -4,17 +4,6 @@
  * src/watcher/index.js
  *
  * Production file-watcher for SmartDesk AI.
- *
- * Responsibilities:
- *  1. Watch user-selected folders (Desktop + Downloads by default).
- *  2. Ignore temp/in-progress files (.tmp, .crdownload, .part, etc.).
- *  3. Debounce each new/modified path for 2 000 ms before processing
- *     (avoids triggering while a download is still writing).
- *  4. Extract full metadata via src/watcher/metadata.js.
- *  5. Insert the file into Supabase `files` table with status "pending".
- *  6. Emit `file:detected` IPC event to the Electron main process callback
- *     so the renderer can be notified.
- *  7. Expose helpers to add/remove watched folders at runtime.
  */
 
 const chokidar = require('chokidar');
@@ -25,6 +14,11 @@ const fs       = require('fs');
 const { extractMetadata } = require('./metadata');
 const { insertFile }      = require('../db/queries');
 const { query }           = require('../db/supabase');
+
+// ─── Safe logging — swallows EPIPE when stdout is closed (packaged app) ───────
+function safeLog(...args)   { try { console.log(...args);   } catch (_) {} }
+function safeError(...args) { try { console.error(...args); } catch (_) {} }
+function safeDebug(...args) { try { if (process.env.NODE_ENV !== 'production') console.log(...args); } catch (_) {} }
 
 // ─── ignored patterns ─────────────────────────────────────────────────────────
 
@@ -144,15 +138,19 @@ async function checkDuplicate(hash, currentPath) {
  *
  * @param {string}   filePath
  * @param {Function} onDetected  Callback supplied by Electron main — receives the full metadata object.
+ * @param {string}   deviceId    Stable UUID for this device.
  */
-async function processFile(filePath, onDetected) {
+async function processFile(filePath, onDetected, deviceId = 'unknown') {
   try {
     // 1. Extract metadata (also re-checks the file still exists)
     const metadata = await extractMetadata(filePath);
     if (!metadata) {
-      console.debug(`[watcher] skipped (gone): ${filePath}`);
+      safeDebug(`[watcher] skipped (gone): ${filePath}`);
       return;
     }
+
+    // Tag metadata with device_id so insertFile stores it
+    metadata.device_id = deviceId;
 
     // 2. Persist to Supabase with status "pending"
     let dbId = null;
@@ -160,9 +158,9 @@ async function processFile(filePath, onDetected) {
       dbId = await insertFile(metadata);
     } catch (dbErr) {
       if (dbErr.code === '23505') {
-        console.debug(`[watcher] duplicate filepath, skipping insert: ${filePath}`);
+        safeDebug(`[watcher] duplicate filepath, skipping insert: ${filePath}`);
       } else {
-        console.error('[watcher] DB insert error:', dbErr.message);
+        safeError('[watcher] DB insert error:', dbErr.message);
       }
     }
 
@@ -194,9 +192,9 @@ async function processFile(filePath, onDetected) {
     // 5. Notify Electron main process → forwarded to renderer via IPC
     onDetected(payload);
 
-    console.log(`[watcher] processed: ${metadata.filename} (${metadata.size_bytes} B)${duplicateOf ? ' ⚠ DUPLICATE' : ''}`);
+    safeLog(`[watcher] processed: ${metadata.filename} (${metadata.size_bytes} B)${duplicateOf ? ' ⚠ DUPLICATE' : ''}`);
   } catch (err) {
-    console.error(`[watcher] pipeline error for ${filePath}:`, err.message);
+    safeError(`[watcher] pipeline error for ${filePath}:`, err.message);
   }
 }
 
@@ -213,7 +211,7 @@ async function processFile(filePath, onDetected) {
  * @param {string[]} [initialFolders]
  *   Override the default Desktop + Downloads watch list.
  */
-function setupWatcher(onDetected, initialFolders) {
+function setupWatcher(onDetected, initialFolders, deviceId = 'unknown') {
   const folders = (initialFolders && initialFolders.length > 0)
     ? initialFolders
     : defaultWatchFolders();
@@ -221,29 +219,24 @@ function setupWatcher(onDetected, initialFolders) {
   watcher = chokidar.watch(folders, {
     ignored: CHOKIDAR_IGNORED,
     persistent: true,
-    ignoreInitial: true,          // don't fire for files already on disk at startup
+    ignoreInitial: true,
     awaitWriteFinish: {
-      stabilityThreshold: 1_000, // file must be stable for 1 s before chokidar fires
+      stabilityThreshold: 1_000,
       pollInterval: 200,
     },
-    depth: 4,                     // traverse up to 4 levels deep
+    depth: 4,
   });
 
-  /**
-   * Shared handler for both 'add' and 'change' events.
-   * Applies the extension-based ignore check then arms the debounce timer.
-   */
   const handleFile = (filePath) => {
     if (shouldIgnore(filePath)) {
-      console.debug(`[watcher] ignored (temp ext): ${filePath}`);
+      safeDebug(`[watcher] ignored (temp ext): ${filePath}`);
       return;
     }
 
-    // Re-arm the debounce: cancel any existing timer, start a fresh 2 s one.
     clearDebounce(filePath);
     const timer = setTimeout(() => {
       debounceMap.delete(filePath);
-      processFile(filePath, onDetected);
+      processFile(filePath, onDetected, deviceId);
     }, DEBOUNCE_MS);
 
     debounceMap.set(filePath, timer);
@@ -253,13 +246,12 @@ function setupWatcher(onDetected, initialFolders) {
     .on('add',    handleFile)
     .on('change', handleFile)
     .on('unlink', (filePath) => {
-      // Cancel any pending processing for a file that was deleted
       clearDebounce(filePath);
-      console.debug(`[watcher] unlinked: ${filePath}`);
+      safeDebug(`[watcher] unlinked: ${filePath}`);
     })
-    .on('error', (err) => console.error('[watcher] error:', err));
+    .on('error', (err) => safeError('[watcher] error:', err));
 
-  console.log('[watcher] watching:', folders);
+  safeLog('[watcher] watching:', folders);
   return watcher;
 }
 
@@ -283,7 +275,7 @@ function updateWatchedFolders(folders) {
 
   // Watch the new set
   if (folders.length > 0) watcher.add(folders);
-  console.log('[watcher] updated folders:', folders);
+  safeLog('[watcher] updated folders:', folders);
 }
 
 /**
@@ -296,7 +288,7 @@ async function closeWatcher() {
   if (watcher) {
     await watcher.close();
     watcher = null;
-    console.log('[watcher] closed');
+    safeLog('[watcher] closed');
   }
 }
 

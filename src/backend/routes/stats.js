@@ -17,18 +17,18 @@ router.get('/', async (_req, res) => {
              FROM sessions WHERE session_date = $1 LIMIT 1`, [today]),
     ]);
 
+    // rows[0] may be undefined when pool is null (no DATABASE_URL) — default to 0
     const session = sessionRes.rows[0] ?? {};
 
     return res.json({
-      filesOrganized:    parseInt(movedRes.rows[0].count)      ?? 0,
-      classified:        parseInt(classifiedRes.rows[0].count) ?? 0,
-      approvals:         parseInt(pendingRes.rows[0].count)    ?? 0,
-      accuracy:          0,
-      // Session stats
-      files_processed:   session.files_processed      ?? 0,
-      folders_created:   session.folders_created      ?? 0,
-      duplicates_removed: session.duplicates_removed  ?? 0,
-      storage_saved_bytes: session.storage_saved_bytes ?? 0,
+      filesOrganized:      parseInt(movedRes.rows[0]?.count      ?? '0') || 0,
+      classified:          parseInt(classifiedRes.rows[0]?.count ?? '0') || 0,
+      approvals:           parseInt(pendingRes.rows[0]?.count    ?? '0') || 0,
+      accuracy:            0,
+      files_processed:     session.files_processed      ?? 0,
+      folders_created:     session.folders_created      ?? 0,
+      duplicates_removed:  session.duplicates_removed   ?? 0,
+      storage_saved_bytes: session.storage_saved_bytes  ?? 0,
     });
   } catch (err) {
     console.error('[stats]', err);

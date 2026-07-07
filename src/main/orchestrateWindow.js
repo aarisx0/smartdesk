@@ -17,6 +17,10 @@
 const { BrowserWindow } = require('electron');
 const path = require('path');
 
+// Safe logger — swallows EPIPE when stdout is closed in the packaged app
+function safeLog(...args)   { try { console.log(...args);   } catch (_) {} }
+function safeError(...args) { try { console.error(...args); } catch (_) {} }
+
 /** @type {BrowserWindow | null} */
 let orchestrateWindow = null;
 
@@ -61,7 +65,7 @@ async function createOrchestrateWindow() {
 
   // Keep the window alive if the renderer process crashes — just reload
   orchestrateWindow.webContents.on('render-process-gone', (_event, details) => {
-    console.error('[orchestrate] renderer gone:', details.reason, '— reloading');
+    safeError('[orchestrate] renderer gone:', details.reason, '— reloading');
     orchestrateWindow?.reload();
   });
 
@@ -74,7 +78,7 @@ async function createOrchestrateWindow() {
 
   // Clean up reference on close (should not happen during normal operation)
   orchestrateWindow.on('closed', () => {
-    console.warn('[orchestrate] hidden window was closed');
+    safeError('[orchestrate] hidden window was closed');
     orchestrateWindow = null;
   });
 
@@ -83,7 +87,7 @@ async function createOrchestrateWindow() {
     orchestrateWindow.webContents.openDevTools({ mode: 'detach' });
   }
 
-  console.log('[orchestrate] hidden window created, waiting for page ready…');
+  safeLog('[orchestrate] hidden window created, waiting for page ready…');
   return orchestrateWindow;
 }
 

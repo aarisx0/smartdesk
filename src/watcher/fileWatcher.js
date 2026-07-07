@@ -1,7 +1,7 @@
 const chokidar = require('chokidar');
 const path = require('path');
 const axios = require('axios');
-require('dotenv').config();
+// NOTE: dotenv is loaded centrally in src/main/index.ts before any module is required.
 
 const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:3001';
 

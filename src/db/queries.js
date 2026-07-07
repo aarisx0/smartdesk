@@ -8,17 +8,27 @@ const { query } = require('./supabase');
 
 /**
  * Insert a new file record and return its generated id.
- * @param {{ filename, extension, filepath, size_bytes, mime_type, content_preview }} metadata
+ * @param {{ filename, extension, filepath, size_bytes, mime_type, content_preview, device_id? }} metadata
  * @returns {Promise<string>} The new file UUID
  */
 async function insertFile(metadata) {
-  const { filename, extension, filepath, size_bytes, mime_type, content_preview } = metadata;
+  const {
+    filename,
+    extension,
+    filepath,
+    size_bytes,
+    mime_type,
+    content_preview,
+    device_id = 'unknown',
+  } = metadata;
+
   const sql = `
-    INSERT INTO files (filename, extension, filepath, size_bytes, mime_type, content_preview)
-    VALUES ($1, $2, $3, $4, $5, $6)
+    INSERT INTO files (device_id, filename, extension, filepath, size_bytes, mime_type, content_preview)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
     RETURNING id
   `;
   const { rows } = await query(sql, [
+    device_id,
     filename,
     extension ?? null,
     filepath,
@@ -31,11 +41,6 @@ async function insertFile(metadata) {
 
 /**
  * Update classification result on an existing file record.
- * @param {string} id
- * @param {string} status           'classified' | 'moved' | 'skipped'
- * @param {string|null} suggestedFolder
- * @param {number|null} confidence   0–1 float
- * @param {string|null} reasoning
  */
 async function updateFileStatus(id, status, suggestedFolder, confidence, reasoning) {
   const sql = `
@@ -47,20 +52,24 @@ async function updateFileStatus(id, status, suggestedFolder, confidence, reasoni
 }
 
 /**
- * Return all files with status = 'pending'.
- * @returns {Promise<object[]>}
+ * Return all pending files for this device.
  */
-async function getPendingFiles() {
-  const { rows } = await query(`SELECT * FROM files WHERE status = 'pending' ORDER BY created_at ASC`);
+async function getPendingFiles(deviceId = 'unknown') {
+  const { rows } = await query(
+    `SELECT * FROM files WHERE status = 'pending' AND device_id = $1 ORDER BY created_at ASC`,
+    [deviceId]
+  );
   return rows;
 }
 
 /**
- * Return all files with status = 'classified'.
- * @returns {Promise<object[]>}
+ * Return all classified files for this device.
  */
-async function getClassifiedFiles() {
-  const { rows } = await query(`SELECT * FROM files WHERE status = 'classified' ORDER BY updated_at DESC`);
+async function getClassifiedFiles(deviceId = 'unknown') {
+  const { rows } = await query(
+    `SELECT * FROM files WHERE status = 'classified' AND device_id = $1 ORDER BY updated_at DESC`,
+    [deviceId]
+  );
   return rows;
 }
 
@@ -70,18 +79,13 @@ async function getClassifiedFiles() {
 
 /**
  * Write one entry to the activity log.
- * @param {'moved'|'created'|'deleted'|'skipped'} action
- * @param {string} filename
- * @param {string|null} fromPath
- * @param {string|null} toPath
- * @param {number|null} sizeBytes
  */
-async function logActivity(action, filename, fromPath, toPath, sizeBytes) {
+async function logActivity(action, filename, fromPath, toPath, sizeBytes, deviceId = 'unknown') {
   const sql = `
-    INSERT INTO activity_log (action, filename, from_path, to_path, file_size_bytes)
-    VALUES ($1, $2, $3, $4, $5)
+    INSERT INTO activity_log (device_id, action, filename, from_path, to_path, file_size_bytes)
+    VALUES ($1, $2, $3, $4, $5, $6)
   `;
-  await query(sql, [action, filename, fromPath ?? null, toPath ?? null, sizeBytes ?? null]);
+  await query(sql, [deviceId, action, filename, fromPath ?? null, toPath ?? null, sizeBytes ?? null]);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -89,36 +93,28 @@ async function logActivity(action, filename, fromPath, toPath, sizeBytes) {
 // ─────────────────────────────────────────────────────────────
 
 /**
- * Insert a new preference row, or increment times_confirmed if a row with the
- * same (pattern_keyword, extension) pair already exists.
- * When times_confirmed reaches 3 the rule is automatically promoted to a
- * learned rule (is_learned_rule = true).
- *
- * @param {string|null} keyword
- * @param {string|null} ext
- * @param {string|null} aiFolder
- * @param {string|null} userFolder
+ * Upsert a preference row for this device.
  */
-async function savePreference(keyword, ext, aiFolder, userFolder) {
+async function savePreference(keyword, ext, aiFolder, userFolder, deviceId = 'unknown') {
   const sql = `
-    INSERT INTO user_preferences (pattern_keyword, extension, ai_suggested_folder, user_confirmed_folder)
-    VALUES ($1, $2, $3, $4)
-    ON CONFLICT (pattern_keyword, extension)
+    INSERT INTO user_preferences (device_id, pattern_keyword, extension, ai_suggested_folder, user_confirmed_folder)
+    VALUES ($1, $2, $3, $4, $5)
+    ON CONFLICT (device_id, pattern_keyword, extension)
     DO UPDATE SET
       times_confirmed       = user_preferences.times_confirmed + 1,
       user_confirmed_folder = EXCLUDED.user_confirmed_folder,
       is_learned_rule       = (user_preferences.times_confirmed + 1) >= 3
   `;
-  await query(sql, [keyword ?? null, ext ?? null, aiFolder ?? null, userFolder ?? null]);
+  await query(sql, [deviceId, keyword ?? null, ext ?? null, aiFolder ?? null, userFolder ?? null]);
 }
 
 /**
- * Return all rows where is_learned_rule = true.
- * @returns {Promise<object[]>}
+ * Return learned rules for this device.
  */
-async function getLearnedRules() {
+async function getLearnedRules(deviceId = 'unknown') {
   const { rows } = await query(
-    `SELECT * FROM user_preferences WHERE is_learned_rule = true ORDER BY times_confirmed DESC`
+    `SELECT * FROM user_preferences WHERE is_learned_rule = true AND device_id = $1 ORDER BY times_confirmed DESC`,
+    [deviceId]
   );
   return rows;
 }
@@ -128,37 +124,28 @@ async function getLearnedRules() {
 // ─────────────────────────────────────────────────────────────
 
 /**
- * Return today's session row, creating it if it doesn't exist yet.
- * @returns {Promise<object>}
+ * Return today's session for this device, creating it if needed.
  */
-async function getTodaySession() {
-  // Try to find today's row first (avoids unnecessary INSERT on every call)
-  const selectSql = `SELECT * FROM sessions WHERE session_date = CURRENT_DATE LIMIT 1`;
-  const { rows } = await query(selectSql);
+async function getTodaySession(deviceId = 'unknown') {
+  const selectSql = `SELECT * FROM sessions WHERE session_date = CURRENT_DATE AND device_id = $1 LIMIT 1`;
+  const { rows } = await query(selectSql, [deviceId]);
   if (rows.length > 0) return rows[0];
 
-  // Create a fresh session for today
   const insertSql = `
-    INSERT INTO sessions (session_date)
-    VALUES (CURRENT_DATE)
-    ON CONFLICT DO NOTHING
+    INSERT INTO sessions (device_id, session_date)
+    VALUES ($1, CURRENT_DATE)
+    ON CONFLICT (device_id, session_date) DO NOTHING
     RETURNING *
   `;
-  const { rows: newRows } = await query(insertSql);
-
-  // Handle the edge-case where a concurrent INSERT already created the row
+  const { rows: newRows } = await query(insertSql, [deviceId]);
   if (newRows.length > 0) return newRows[0];
-  const { rows: fallback } = await query(selectSql);
+
+  const { rows: fallback } = await query(selectSql, [deviceId]);
   return fallback[0];
 }
 
 /**
- * Overwrite session counters with the provided values.
- * @param {string} id
- * @param {number} filesProcessed
- * @param {number} foldersCreated
- * @param {number} duplicatesRemoved
- * @param {number} storageSaved
+ * Overwrite session counters.
  */
 async function updateSession(id, filesProcessed, foldersCreated, duplicatesRemoved, storageSaved) {
   const sql = `
@@ -172,6 +159,25 @@ async function updateSession(id, filesProcessed, foldersCreated, duplicatesRemov
   await query(sql, [id, filesProcessed, foldersCreated, duplicatesRemoved, storageSaved]);
 }
 
+// ─────────────────────────────────────────────────────────────
+//  devices
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Register or update this device in the devices table.
+ * Called once on every app launch so last_seen stays current.
+ */
+async function upsertDevice(deviceId, label) {
+  const sql = `
+    INSERT INTO devices (id, label, first_seen, last_seen)
+    VALUES ($1, $2, now(), now())
+    ON CONFLICT (id) DO UPDATE SET
+      label     = EXCLUDED.label,
+      last_seen = now()
+  `;
+  await query(sql, [deviceId, label]);
+}
+
 module.exports = {
   insertFile,
   updateFileStatus,
@@ -182,4 +188,5 @@ module.exports = {
   getLearnedRules,
   getTodaySession,
   updateSession,
+  upsertDevice,
 };

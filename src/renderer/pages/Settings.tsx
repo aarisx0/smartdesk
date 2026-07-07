@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
-  FolderOpen, Plus, Trash2, Save, Eye, EyeOff, ExternalLink,
-  BookOpen, AlertTriangle, CheckCircle2, RefreshCw, X,
+  FolderOpen, Plus, Trash2, Save,
+  BookOpen, AlertTriangle, CheckCircle2, RefreshCw, X, ExternalLink,
 } from 'lucide-react';
 
 interface FolderEntry { path: string; enabled: boolean }
@@ -26,32 +26,26 @@ const fadeUp = {
 };
 
 export default function Settings() {
-  const [folders,     setFolders]     = useState<FolderEntry[]>([]);
-  const [apiKey,      setApiKey]      = useState('');
-  const [showKey,     setShowKey]     = useState(false);
-  const [autoApprove, setAutoApprove] = useState(false);
-  const [saved,       setSaved]       = useState(false);
+  const [folders,      setFolders]      = useState<FolderEntry[]>([]);
+  const [autoApprove,  setAutoApprove]  = useState(false);
+  const [saved,        setSaved]        = useState(false);
 
-  const [rules,       setRules]       = useState<LearnedRule[]>([]);
+  const [rules,        setRules]        = useState<LearnedRule[]>([]);
   const [rulesLoading, setRulesLoading] = useState(true);
   const [clearConfirm, setClearConfirm] = useState(false);
-  const [dbStatus,    setDbStatus]    = useState<'ok' | 'error' | 'checking'>('checking');
+  const [dbStatus,     setDbStatus]     = useState<'ok' | 'error' | 'checking'>('checking');
 
   // ── load settings ──────────────────────────────────────────────────────────
-
   useEffect(() => {
     (async () => {
       const stored = await window.electronAPI?.store.get('watchedFolders') as FolderEntry[] | null;
       if (stored) setFolders(Array.isArray(stored) ? stored : []);
-      const key = await window.electronAPI?.store.get('watsonxApiKey') as string | null;
-      if (key) setApiKey(key);
       const aa = await window.electronAPI?.store.get('autoApprove') as boolean | null;
       if (aa !== null && aa !== undefined) setAutoApprove(aa);
     })();
   }, []);
 
   // ── DB health check ────────────────────────────────────────────────────────
-
   const checkDb = useCallback(async () => {
     setDbStatus('checking');
     try {
@@ -63,7 +57,6 @@ export default function Settings() {
   }, []);
 
   // ── load learned rules ─────────────────────────────────────────────────────
-
   const loadRules = useCallback(async () => {
     setRulesLoading(true);
     try {
@@ -81,7 +74,6 @@ export default function Settings() {
   useEffect(() => { loadRules(); checkDb(); }, [loadRules, checkDb]);
 
   // ── folder management ──────────────────────────────────────────────────────
-
   const addFolder = async () => {
     const paths = await window.electronAPI?.openFolder();
     if (!paths) return;
@@ -96,19 +88,17 @@ export default function Settings() {
     setFolders((prev) => prev.filter((_, i) => i !== idx));
 
   // ── save ───────────────────────────────────────────────────────────────────
-
   const handleSave = async () => {
     await window.electronAPI?.store.set('watchedFolders', folders);
-    await window.electronAPI?.store.set('watsonxApiKey', apiKey);
     await window.electronAPI?.store.set('autoApprove', autoApprove);
-    // Also update watcher
-    await window.electronAPI?.watcher.setFolders(folders.filter((f) => f.enabled).map((f) => f.path));
+    await window.electronAPI?.watcher.setFolders(
+      folders.filter((f) => f.enabled).map((f) => f.path)
+    );
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
   };
 
-  // ── delete rule ────────────────────────────────────────────────────────────
-
+  // ── delete / clear rules ───────────────────────────────────────────────────
   const deleteRule = async (id: string) => {
     try {
       await fetch(`${API}/api/learning/rules/${id}`, { method: 'DELETE' });
@@ -117,8 +107,6 @@ export default function Settings() {
       console.error('Failed to delete rule', err);
     }
   };
-
-  // ── clear all rules ────────────────────────────────────────────────────────
 
   const clearAllRules = async () => {
     try {
@@ -135,11 +123,11 @@ export default function Settings() {
       <div>
         <h1 className="text-2xl font-bold text-white">Settings</h1>
         <p className="text-sm mt-0.5" style={{ color: '#8B8BAD' }}>
-          Configure folders, API keys, automation, and learned rules
+          Manage watched folders, automation rules, and AI-learned preferences
         </p>
       </div>
 
-      {/* ── DB Status ─────────────────────────────────────────────────────── */}
+      {/* ── DB Status ──────────────────────────────────────────────────────── */}
       <section className="glass-card p-4 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <span className="text-sm text-white font-medium">Database Connection</span>
@@ -155,7 +143,7 @@ export default function Settings() {
           )}
           {dbStatus === 'error' && (
             <span className="text-xs flex items-center gap-1.5" style={{ color: '#FCA5A5' }}>
-              <AlertTriangle size={12} /> Disconnected
+              <AlertTriangle size={12} /> Disconnected — check your .env file
             </span>
           )}
         </div>
@@ -169,7 +157,7 @@ export default function Settings() {
         </motion.button>
       </section>
 
-      {/* ── Watched Folders ───────────────────────────────────────────────── */}
+      {/* ── Watched Folders ────────────────────────────────────────────────── */}
       <section className="glass-card p-6">
         <h2 className="text-sm font-semibold text-white mb-4 flex items-center gap-2">
           <FolderOpen size={16} className="text-indigo-400" />
@@ -178,7 +166,7 @@ export default function Settings() {
         <div className="space-y-2 mb-4">
           {folders.length === 0 && (
             <p className="text-sm py-4 text-center" style={{ color: '#555575' }}>
-              No folders added yet
+              No folders added yet. Click "Add Folder" to start monitoring.
             </p>
           )}
           <AnimatePresence>
@@ -225,38 +213,14 @@ export default function Settings() {
         </motion.button>
       </section>
 
-      {/* ── API Key ───────────────────────────────────────────────────────── */}
-      <section className="glass-card p-6">
-        <h2 className="text-sm font-semibold text-white mb-4">IBM watsonx API Key</h2>
-        <div className="relative">
-          <input
-            type={showKey ? 'text' : 'password'}
-            value={apiKey}
-            onChange={(e) => setApiKey(e.target.value)}
-            placeholder="Enter your IBM watsonx API key…"
-            className="input-dark pr-10"
-          />
-          <button
-            onClick={() => setShowKey((v) => !v)}
-            className="absolute right-3 top-1/2 -translate-y-1/2 transition-opacity hover:opacity-100 opacity-60"
-            style={{ color: '#555575' }}
-          >
-            {showKey ? <EyeOff size={15} /> : <Eye size={15} />}
-          </button>
-        </div>
-        <p className="text-xs mt-2" style={{ color: '#555575' }}>
-          Stored locally only. Never sent to any third party.
-        </p>
-      </section>
-
-      {/* ── Automation ────────────────────────────────────────────────────── */}
+      {/* ── Automation ─────────────────────────────────────────────────────── */}
       <section className="glass-card p-6">
         <h2 className="text-sm font-semibold text-white mb-4">Automation</h2>
         <label className="flex items-center justify-between cursor-pointer">
           <div>
             <p className="text-sm text-white">Auto-approve high-confidence moves</p>
             <p className="text-xs mt-0.5" style={{ color: '#555575' }}>
-              Automatically move files when confidence &gt; 90%
+              Automatically move files when AI confidence is above 90%
             </p>
           </div>
           <div
@@ -277,7 +241,7 @@ export default function Settings() {
         </label>
       </section>
 
-      {/* ── Learned Rules ─────────────────────────────────────────────────── */}
+      {/* ── Learned Rules ──────────────────────────────────────────────────── */}
       <section className="glass-card overflow-hidden">
         <div className="flex items-center justify-between px-6 py-4 border-b"
           style={{ borderColor: 'rgba(255,255,255,0.06)' }}>
@@ -319,11 +283,10 @@ export default function Settings() {
           </div>
         ) : rules.length === 0 ? (
           <div className="py-10 text-center text-sm" style={{ color: '#555575' }}>
-            No learned rules yet. SmartDesk learns from your approvals.
+            No learned rules yet. SmartDesk learns from your approvals automatically.
           </div>
         ) : (
           <>
-            {/* Table header */}
             <div className="grid grid-cols-12 px-6 py-2.5 text-xs font-semibold uppercase tracking-wider"
               style={{ color: '#555575', borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
               <span className="col-span-4">Pattern</span>
@@ -362,7 +325,8 @@ export default function Settings() {
                       </span>
                     </div>
                     <div className="col-span-2 flex items-center justify-center gap-1.5">
-                      <span className="text-xs font-semibold" style={{ color: rule.is_learned_rule ? '#34D399' : '#FBBF24' }}>
+                      <span className="text-xs font-semibold"
+                        style={{ color: rule.is_learned_rule ? '#34D399' : '#FBBF24' }}>
                         {rule.times_confirmed}×
                       </span>
                       {rule.is_learned_rule && (
@@ -388,7 +352,7 @@ export default function Settings() {
         )}
       </section>
 
-      {/* ── Save button ───────────────────────────────────────────────────── */}
+      {/* ── Save button ────────────────────────────────────────────────────── */}
       <motion.button
         whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.97 }}
         onClick={handleSave}
@@ -398,7 +362,7 @@ export default function Settings() {
         {saved ? '✓ Saved!' : 'Save Settings'}
       </motion.button>
 
-      {/* ── Clear rules confirmation dialog ───────────────────────────────── */}
+      {/* ── Clear rules confirmation ────────────────────────────────────────── */}
       <AnimatePresence>
         {clearConfirm && (
           <motion.div
@@ -415,8 +379,8 @@ export default function Settings() {
               <AlertTriangle size={32} className="mx-auto mb-3" style={{ color: '#FCA5A5' }} />
               <h3 className="text-base font-bold text-white mb-2">Clear All Rules?</h3>
               <p className="text-sm mb-5" style={{ color: '#8B8BAD' }}>
-                This will delete all <strong className="text-white">{rules.length}</strong> learned rules.
-                SmartDesk will start relearning from scratch.
+                This will delete all <strong className="text-white">{rules.length}</strong> learned
+                rules. SmartDesk will start relearning from your next approvals.
               </p>
               <div className="flex gap-3">
                 <button
