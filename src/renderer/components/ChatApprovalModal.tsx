@@ -6,8 +6,7 @@ import {
   FolderOpen, Info, Eye, Sparkles,
 } from 'lucide-react';
 import type { ApprovalPlan } from '../hooks/useChat';
-
-const API = 'http://localhost:3001';
+import { apiFetch } from '../lib/apiFetch';
 
 function formatBytes(bytes: number | null) {
   if (!bytes) return '-';
@@ -67,7 +66,7 @@ export default function ChatApprovalModal({
     setError(null);
 
     try {
-      const res = await fetch(`${API}/api/chat/execute`, {
+      const res = await apiFetch('/api/chat/execute', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ planId: plan.id }),

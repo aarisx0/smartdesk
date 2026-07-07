@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { apiFetch } from '../lib/apiFetch';
 
 export interface PendingApproval {
   id: string;
@@ -17,7 +18,7 @@ export function useApprovals() {
   const fetchApprovals = useCallback(async () => {
     setLoading(true);
     try {
-      const res  = await fetch('http://localhost:3001/api/activity?status=pending&limit=50');
+      const res  = await apiFetch('/api/activity?status=pending&limit=50');
       const data = await res.json() as any[];
 
       // Map the `files` table pending rows → PendingApproval shape
@@ -46,7 +47,7 @@ export function useApprovals() {
 
   const approve = useCallback(async (id: string) => {
     try {
-      await fetch('http://localhost:3001/api/moves/approve', {
+      await apiFetch('/api/moves/approve', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ fileId: id, approved: true }),
@@ -59,7 +60,7 @@ export function useApprovals() {
 
   const reject = useCallback(async (id: string) => {
     try {
-      await fetch('http://localhost:3001/api/moves/approve', {
+      await apiFetch('/api/moves/approve', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ fileId: id, approved: false }),

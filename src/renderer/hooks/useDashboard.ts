@@ -1,6 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-
-const API = 'http://localhost:3001';
+import { apiFetch } from '../lib/apiFetch';
 
 // ─── types ────────────────────────────────────────────────────────────────────
 
@@ -81,7 +80,7 @@ export function useDashboard() {
 
   const fetchStats = useCallback(async () => {
     try {
-      const res  = await fetch(`${API}/api/stats`);
+      const res  = await apiFetch('/api/stats');
       const data = await res.json();
       setStats({
         filesOrganized:    data.files_processed      ?? data.filesOrganized      ?? 0,
@@ -95,7 +94,7 @@ export function useDashboard() {
   const fetchOrganized = useCallback(async () => {
     try {
       // Reuse activity endpoint for moved/classified files
-      const res  = await fetch(`${API}/api/activity?limit=20`);
+      const res  = await apiFetch('/api/activity?limit=20');
       const data = await res.json() as any[];
       if (!Array.isArray(data)) return;
       // Map activity_log rows to OrganizedFile shape
@@ -114,7 +113,7 @@ export function useDashboard() {
 
   const fetchPending = useCallback(async () => {
     try {
-      const res  = await fetch(`${API}/api/activity?status=pending&limit=15`);
+      const res  = await apiFetch('/api/activity?status=pending&limit=15');
       const data = await res.json() as any[];
       if (!Array.isArray(data)) return;
       setPending(data.map((row) => ({
@@ -133,7 +132,7 @@ export function useDashboard() {
 
   const fetchHealth = useCallback(async () => {
     try {
-      const res  = await fetch(`${API}/api/stats`);
+      const res  = await apiFetch('/api/stats');
       const data = await res.json();
       const total     = (data.classified ?? 0) + (data.approvals ?? 0);
       const organized = data.classified ?? 0;
@@ -149,7 +148,7 @@ export function useDashboard() {
       if (folders && folders.length > 0) { setWatchedFolders(folders); return; }
     } catch { /* not in Electron */ }
     try {
-      const res  = await fetch(`${API}/api/folders`);
+      const res  = await apiFetch('/api/folders');
       const data = await res.json() as { path: string }[];
       if (Array.isArray(data)) setWatchedFolders(data.map((f) => f.path));
     } catch (e) { console.error('[dashboard] fetchWatchedFolders', e); }
@@ -160,7 +159,7 @@ export function useDashboard() {
   const approveFile = useCallback(async (id: string) => {
     setPending((p) => p.filter((f) => f.id !== id));
     try {
-      await fetch(`${API}/api/moves/approve`, {
+      await apiFetch('/api/moves/approve', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ fileId: id, approved: true }),
@@ -175,7 +174,7 @@ export function useDashboard() {
   const skipFile = useCallback(async (id: string) => {
     setPending((p) => p.filter((f) => f.id !== id));
     try {
-      await fetch(`${API}/api/moves/approve`, {
+      await apiFetch('/api/moves/approve', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ fileId: id, approved: false }),
@@ -250,6 +249,18 @@ export function useDashboard() {
       unsubClassified?.();
     };
   }, []);
+
+  // ── DB migration signal ────────────────────────────────────────────────────
+  // When the main process re-tags old 'unknown' rows to this device_id on
+  // first launch, it fires db:migrated. Refresh everything so the dashboard
+  // immediately shows the recovered data.
+  useEffect(() => {
+    const unsub = window.electronAPI?.onDbMigrated?.((payload) => {
+      console.log(`[dashboard] db:migrated — refreshing (${payload.rowsMigrated} rows recovered)`);
+      Promise.all([fetchStats(), fetchOrganized(), fetchPending(), fetchHealth()]);
+    });
+    return () => unsub?.();
+  }, [fetchStats, fetchOrganized, fetchPending, fetchHealth]);
 
   return {
     stats, organized, pending, health, watchedFolders,

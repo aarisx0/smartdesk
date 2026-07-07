@@ -71,6 +71,18 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Chat with wxo Orchestrate agent — free-form conversation
   chatWithAgent: (message: string): Promise<{ reply?: string; error?: string }> =>
     ipcRenderer.invoke('agent:chat', message),
+
+  // Device identity — stable UUID for this installation (used to scope DB queries)
+  getDeviceId: (): Promise<string> => ipcRenderer.invoke('device:getId'),
+  getDeviceLabel: (): Promise<string> => ipcRenderer.invoke('device:getLabel'),
+
+  // Fired once after launch when old 'unknown' rows are re-tagged to this device.
+  // Renderer should refresh all data when this fires.
+  onDbMigrated: (callback: (payload: { rowsMigrated: number }) => void): (() => void) => {
+    const listener = (_: Electron.IpcRendererEvent, payload: { rowsMigrated: number }) => callback(payload);
+    ipcRenderer.on('db:migrated', listener);
+    return () => ipcRenderer.removeListener('db:migrated', listener);
+  },
 });
 
 // Types available in renderer window

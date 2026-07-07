@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { Routes, Route, useLocation } from 'react-router-dom';
 import { AnimatePresence } from 'framer-motion';
 import Layout from './components/Layout';
@@ -7,6 +8,10 @@ import Analytics from './pages/Analytics';
 import Duplicates from './pages/Duplicates';
 import Settings from './pages/Settings';
 import Chat from './pages/Chat';
+import { prewarmDeviceId } from './lib/apiFetch';
+
+// Start resolving device_id immediately — before any page mounts and fetches data
+prewarmDeviceId();
 
 export default function App() {
   const location = useLocation();

@@ -46,6 +46,9 @@ interface ElectronAPI {
   onFileClassified(callback: (payload: FileDetectedPayload & { suggested_folder: string; confidence_score: number; ai_reasoning: string }) => void): () => void;
   invoke(channel: string, ...args: unknown[]): Promise<unknown>;
   chatWithAgent(message: string): Promise<{ reply?: string; error?: string }>;
+  getDeviceId(): Promise<string>;
+  getDeviceLabel(): Promise<string>;
+  onDbMigrated(callback: (payload: { rowsMigrated: number }) => void): () => void;
 }
 
 declare global {

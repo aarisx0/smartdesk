@@ -260,6 +260,48 @@ async function bootstrap(): Promise<void> {
   const { upsertDevice } = require('../db/queries');
   upsertDevice(DEVICE_ID, DEVICE_LABEL).catch((e: Error) => safeError('[main] upsertDevice failed:', e.message));
 
+  // ── One-time migration: re-tag all 'unknown' rows to this device ────────────
+  // When the app was run before device_id isolation was introduced, every row
+  // was stored with device_id = 'unknown'.  On the first launch after the fix
+  // we claim all those rows for this device so existing data is not lost.
+  // This is safe to run on every launch — it's a no-op once all rows are tagged.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { query: dbQuery } = require('../db/supabase');
+  (async () => {
+    try {
+      const tables = [
+        'files',
+        'activity_log',
+        'sessions',
+        'chat_sessions',
+        'user_preferences',
+        'duplicate_groups',
+      ];
+      let totalMigrated = 0;
+      for (const table of tables) {
+        const result = await dbQuery(
+          `UPDATE ${table} SET device_id = $1 WHERE device_id = 'unknown'`,
+          [DEVICE_ID]
+        );
+        // rowCount can be null in some pg versions — treat null as 0
+        const count = result.rowCount ?? 0;
+        if (count > 0) {
+          safeLog(`[migration] re-tagged ${count} rows in ${table} → device ${DEVICE_ID}`);
+          totalMigrated += count;
+        }
+      }
+      if (totalMigrated > 0) {
+        safeLog(`[migration] complete — ${totalMigrated} total rows claimed for this device`);
+        // Tell the renderer to refresh all its data now that rows are properly tagged
+        mainWindow?.webContents.send('db:migrated', { rowsMigrated: totalMigrated });
+      } else {
+        safeLog('[migration] nothing to migrate (all rows already tagged)');
+      }
+    } catch (err: unknown) {
+      safeError('[migration] error:', err instanceof Error ? err.message : err);
+    }
+  })();
+
   setupWatcher(
     async (payload: FileMetadata) => {
       const isDuplicate = !!(payload as any).duplicateOf;
@@ -358,6 +400,10 @@ ipcMain.handle('shell:trashItem', async (_event, filePath: string) =>
 ipcMain.handle('store:get',    (_event, key: string)                 => store.get(key));
 ipcMain.handle('store:set',    (_event, key: string, value: unknown) => store.set(key, value));
 ipcMain.handle('store:delete', (_event, key: string)                 => store.delete(key));
+
+// Device identity — renderer calls this to get the stable UUID for this install
+ipcMain.handle('device:getId',   () => DEVICE_ID);
+ipcMain.handle('device:getLabel', () => DEVICE_LABEL);
 
 // Watched folders
 ipcMain.handle('watcher:setFolders', (_event, folders: string[]) => {

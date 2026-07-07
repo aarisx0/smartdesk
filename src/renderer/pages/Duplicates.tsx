@@ -5,6 +5,7 @@ import {
   ChevronDown, ChevronUp, Star, FolderOpen, AlertTriangle,
 } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
+import { apiFetch } from '../lib/apiFetch';
 
 // ─── types ────────────────────────────────────────────────────────────────────
 
@@ -256,7 +257,7 @@ export default function Duplicates() {
   const fetchGroups = useCallback(async () => {
     setLoading(true);
     try {
-      const res  = await fetch('http://localhost:3001/api/duplicates');
+      const res  = await apiFetch('/api/duplicates');
       const data = await res.json();
       // Parse stored JSONB arrays back into FileInfo[]
       const parsed: DuplicateGroup[] = (data as any[]).map((row) => {
@@ -293,7 +294,7 @@ export default function Duplicates() {
     try {
       // Get watched folders from Electron store, fall back to default
       const watchedFolders = await window.electronAPI?.watcher?.getFolders?.() ?? [];
-      const res  = await fetch('http://localhost:3001/api/duplicates/scan', {
+      const res  = await apiFetch('/api/duplicates/scan', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ folders: watchedFolders }),
@@ -318,7 +319,7 @@ export default function Duplicates() {
       await window.electronAPI?.invoke('shell:trashItem', fp);
     }
     // Mark resolved in DB
-    await fetch('http://localhost:3001/api/duplicates/resolve', {
+    await apiFetch('/api/duplicates/resolve', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ hash: confirm.hash }),
@@ -328,7 +329,7 @@ export default function Duplicates() {
   };
 
   const handleKeepAll = async (hash: string) => {
-    await fetch('http://localhost:3001/api/duplicates/resolve', {
+    await apiFetch('/api/duplicates/resolve', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ hash }),

@@ -4,6 +4,7 @@ import {
   FolderOpen, Plus, Trash2, Save,
   BookOpen, AlertTriangle, CheckCircle2, RefreshCw, X, ExternalLink,
 } from 'lucide-react';
+import { apiFetch } from '../lib/apiFetch';
 
 interface FolderEntry { path: string; enabled: boolean }
 
@@ -16,8 +17,6 @@ interface LearnedRule {
   is_learned_rule: boolean;
   created_at: string;
 }
-
-const API = 'http://localhost:3001';
 
 const fadeUp = {
   hidden:  { opacity: 0, y: 12 },
@@ -49,7 +48,7 @@ export default function Settings() {
   const checkDb = useCallback(async () => {
     setDbStatus('checking');
     try {
-      const res = await fetch(`${API}/health`);
+      const res = await apiFetch('/health');
       setDbStatus(res.ok ? 'ok' : 'error');
     } catch {
       setDbStatus('error');
@@ -60,7 +59,7 @@ export default function Settings() {
   const loadRules = useCallback(async () => {
     setRulesLoading(true);
     try {
-      const res  = await fetch(`${API}/api/learning/rules`);
+      const res  = await apiFetch('/api/learning/rules');
       const data = await res.json();
       setRules(Array.isArray(data) ? data : []);
     } catch (err) {
@@ -101,7 +100,7 @@ export default function Settings() {
   // ── delete / clear rules ───────────────────────────────────────────────────
   const deleteRule = async (id: string) => {
     try {
-      await fetch(`${API}/api/learning/rules/${id}`, { method: 'DELETE' });
+      await apiFetch(`/api/learning/rules/${id}`, { method: 'DELETE' });
       setRules((prev) => prev.filter((r) => r.id !== id));
     } catch (err) {
       console.error('Failed to delete rule', err);
@@ -110,7 +109,7 @@ export default function Settings() {
 
   const clearAllRules = async () => {
     try {
-      await fetch(`${API}/api/learning/rules`, { method: 'DELETE' });
+      await apiFetch('/api/learning/rules', { method: 'DELETE' });
       setRules([]);
       setClearConfirm(false);
     } catch (err) {

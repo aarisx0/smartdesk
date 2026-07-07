@@ -1,7 +1,6 @@
-﻿import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import type { SearchResultItem, SearchMeta } from '../components/SearchResults';
-
-const API = 'http://localhost:3001';
+import { apiFetch } from '../lib/apiFetch';
 
 // ─── types ────────────────────────────────────────────────────────────────────
 
@@ -241,7 +240,7 @@ export function useChat() {
   const tryBuildOrganizeApprovalPlan = useCallback(async (requestText: string, sourceHint?: string) => {
     try {
       const target = sourceHint || 'watched folders';
-      const planRes = await fetch(`${API}/api/chat`, {
+      const planRes = await apiFetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -277,7 +276,7 @@ export function useChat() {
     await withTyping(async () => {
       await delay(500);
       try {
-        const res  = await fetch(`${API}/api/activity?status=pending&limit=40`);
+        const res  = await apiFetch('/api/activity?status=pending&limit=40');
         const data = await res.json() as any[];
         const files = mapPendingFiles(data);
 
@@ -307,7 +306,7 @@ export function useChat() {
     await withTyping(async () => {
       await delay(250);
       try {
-        const res  = await fetch(`${API}/api/search?q=${encodeURIComponent(query)}`);
+        const res  = await apiFetch(`/api/search?q=${encodeURIComponent(query)}`);
         const resp = await res.json() as { results: SearchResultItem[]; meta: SearchMeta };
         const results = resp.results ?? [];
         const meta    = resp.meta ?? { query, keywords: [], extHint: null, durationMs: 0, totalFound: 0 };
@@ -333,7 +332,7 @@ export function useChat() {
     await withTyping(async () => {
       await delay(250);
       try {
-        const res  = await fetch(`${API}/api/search?q=${encodeURIComponent(query)}`);
+        const res  = await apiFetch(`/api/search?q=${encodeURIComponent(query)}`);
         const resp = await res.json() as { results: SearchResultItem[]; meta: SearchMeta };
         const results = resp.results ?? [];
         const meta    = resp.meta ?? { query, keywords: [], extHint: null, durationMs: 0, totalFound: 0 };
@@ -381,7 +380,7 @@ export function useChat() {
     await withTyping(async () => {
       await delay(400);
       try {
-        const res   = await fetch(`${API}/api/duplicates`);
+        const res   = await apiFetch('/api/duplicates');
         const data  = await res.json() as any[];
         const count = Array.isArray(data) ? data.length : 0;
         push('assistant', { type: 'action', action: {
@@ -403,7 +402,7 @@ export function useChat() {
     await withTyping(async () => {
       await delay(500);
       try {
-        const res  = await fetch(`${API}/api/stats`);
+        const res  = await apiFetch('/api/stats');
         const data = await res.json();
         const total     = (data.classified ?? 0) + (data.approvals ?? 0) + (data.filesOrganized ?? 0);
         const organized = data.classified ?? 0;
@@ -431,7 +430,7 @@ export function useChat() {
 
       try {
         // ── Direct scan — never goes through IBM agent ──────────────────────
-        const res = await fetch(`${API}/api/chat/scan`, {
+        const res = await apiFetch('/api/chat/scan', {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
           body:    JSON.stringify({ folder: hint || null }),
@@ -471,7 +470,7 @@ export function useChat() {
     await withTyping(async () => {
       await delay(400);
       try {
-        const res  = await fetch(`${API}/api/activity?status=pending&limit=40`);
+        const res  = await apiFetch('/api/activity?status=pending&limit=40');
         const data = await res.json() as any[];
         const files = mapPendingFiles(data);
 
@@ -500,7 +499,7 @@ export function useChat() {
     await withTyping(async () => {
       await delay(250);
       try {
-        const res = await fetch(`${API}/api/chat/structure`, {
+        const res = await apiFetch('/api/chat/structure', {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
           body:    JSON.stringify({ folder: folderHint }),
@@ -615,7 +614,7 @@ export function useChat() {
           : (specificFile ? `move ${specificFile} from ${source} to ${destination}` : `move all files from ${source} to ${destination}`);
 
         try {
-          const planRes = await fetch(`${API}/api/chat`, {
+          const planRes = await apiFetch('/api/chat', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ message: buildMessage, threadId: threadIdRef.current }),
           });
@@ -650,7 +649,7 @@ export function useChat() {
       await withTyping(async () => {
         try {
           // Re-send with explicit instruction to produce a structured plan
-          const res = await fetch(`${API}/api/chat`, {
+          const res = await apiFetch('/api/chat', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               message: `${text} — please produce a SmartDesk action plan now (respond in the required JSON format with intent and approvalPlan)`,
@@ -687,7 +686,7 @@ export function useChat() {
       let agentSucceeded = false;
 
       try {
-        const res = await fetch(`${API}/api/chat`, {
+        const res = await apiFetch('/api/chat', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ message: text, threadId: threadIdRef.current }),
         });
@@ -855,7 +854,7 @@ export function useChat() {
       };
       if (sessionIdRef.current) body.id = sessionIdRef.current;
 
-      const res  = await fetch(`${API}/api/sessions`, {
+      const res  = await apiFetch('/api/sessions', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify(body),
@@ -879,7 +878,7 @@ export function useChat() {
    */
   const loadSession = useCallback(async (id: string): Promise<void> => {
     try {
-      const res  = await fetch(`${API}/api/sessions/${id}`);
+      const res  = await apiFetch(`/api/sessions/${id}`);
       const data = await res.json() as {
         id: string;
         messages: any[];
@@ -923,7 +922,7 @@ export function useChat() {
    */
   const deleteSession = useCallback(async (id: string): Promise<void> => {
     try {
-      await fetch(`${API}/api/sessions/${id}`, { method: 'DELETE' });
+      await apiFetch(`/api/sessions/${id}`, { method: 'DELETE' });
       if (sessionIdRef.current === id) newSession();
     } catch (err) {
       console.error('[useChat] deleteSession failed:', err);

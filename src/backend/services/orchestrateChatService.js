@@ -2201,7 +2201,40 @@ async function processChatMessage(message, incomingThreadId = null) {
     normalized.threadId = rawResponse?.thread_id || threadId || null;
   } catch (err) {
     console.error('[orchestrateChat] agent request failed:', err.message);
-    return buildUnavailableFallback();
+    // ── Local fallback: infer intent from the user's message directly ─────
+    // Instead of showing an error, use the local NLP engine to classify the
+    // request. This handles all common commands (find, move, delete, stats,
+    // duplicates, etc.) without needing IBM to be reachable.
+    try {
+      const localIntent = inferIntentFromText(message, message);
+      // Generate a context-aware reply based on the intent type
+      const intentReplies = {
+        [INTENT.FIND_FILE]:        `Searching for files matching your request...`,
+        [INTENT.MOVE_FILES]:       `I can prepare a plan to move those files. Let me check what's available.`,
+        [INTENT.DELETE_FILE]:      `I can prepare a deletion plan. Let me find those files first.`,
+        [INTENT.RENAME_FILE]:      `I can rename that for you. Let me locate it.`,
+        [INTENT.ORGANIZE_FOLDER]:  `I'll prepare an organisation plan for your approval.`,
+        [INTENT.SCAN_STRUCTURE]:   `Scanning your folder structure now...`,
+        [INTENT.SHOW_DUPLICATES]:  `Let me check for duplicate files across your watched folders.`,
+        [INTENT.STORAGE_REPORT]:   `Generating a storage report from your files...`,
+        [INTENT.SHOW_PENDING]:     `Fetching files waiting for your approval...`,
+        [INTENT.CREATE_FOLDER]:    `I can create that folder for you.`,
+        [INTENT.MOVE_FOLDER]:      `I can prepare a plan to move that folder.`,
+        [INTENT.COUNT_FOLDER_ITEMS]: `Let me count the files in that folder.`,
+        [INTENT.CHAT]:             `I'm working in offline mode right now. I can still help you find, move, or organise files — just tell me what you need.`,
+      };
+      const reply = intentReplies[localIntent?.type] || intentReplies[INTENT.CHAT];
+      normalized = {
+        reply,
+        intent:   localIntent,
+        threadId: incomingThreadId,
+        meta:     { source: 'local', available: false },
+      };
+      console.log('[orchestrateChat] local fallback intent:', localIntent?.type);
+    } catch (localErr) {
+      console.error('[orchestrateChat] local fallback also failed:', localErr.message);
+      return buildUnavailableFallback();
+    }
   }
 
   // ── Smart delete detection ────────────────────────────────────────────────

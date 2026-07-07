@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { apiFetch } from '../lib/apiFetch';
 
 interface Stats {
   filesOrganized: number;
@@ -13,7 +14,7 @@ export function useStats() {
   useEffect(() => {
     const load = async () => {
       try {
-        const res  = await fetch('http://localhost:3001/api/stats');
+        const res  = await apiFetch('/api/stats');
         const data = await res.json() as Stats;
         setStats(data);
       } catch (err) {

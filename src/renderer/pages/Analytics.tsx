@@ -9,6 +9,7 @@ import {
   ArrowRight, FolderOpen, Download, Filter,
 } from 'lucide-react';
 import { formatDistanceToNow, format } from 'date-fns';
+import { apiFetch } from '../lib/apiFetch';
 
 // ─── types ────────────────────────────────────────────────────────────────────
 
@@ -90,7 +91,7 @@ export default function Analytics() {
   const fetchAll = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await fetch('http://localhost:3001/api/analytics');
+      const res = await apiFetch('/api/analytics');
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
 
@@ -142,6 +143,12 @@ export default function Analytics() {
   }, []);
 
   useEffect(() => { fetchAll(); }, [fetchAll]);
+
+  // Refresh when main process finishes re-tagging old 'unknown' rows
+  useEffect(() => {
+    const unsub = window.electronAPI?.onDbMigrated?.(() => fetchAll());
+    return () => unsub?.();
+  }, [fetchAll]);
 
   // ── filtered activity ──────────────────────────────────────────────────────
   const filtered = filter === 'all'

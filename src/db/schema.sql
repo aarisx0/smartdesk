@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS user_preferences (
   user_confirmed_folder TEXT,
   times_confirmed       INT            DEFAULT 1,
   is_learned_rule       BOOLEAN        DEFAULT false,
-  created_at            TIMESTAMPTZ    DEFAULT now()
+  created_at            TIMESTAMPTZ    DEFAULT now(),
+  UNIQUE (device_id, pattern_keyword, extension)
 );
 
 -- ─────────────────────────────────────────────────────────────
@@ -167,3 +168,6 @@ ALTER TABLE files ADD CONSTRAINT IF NOT EXISTS files_device_filepath_unique UNIQ
 
 -- Re-add UNIQUE constraint on sessions scoped to device
 ALTER TABLE sessions ADD CONSTRAINT IF NOT EXISTS sessions_device_date_unique UNIQUE (device_id, session_date);
+
+-- Add UNIQUE constraint on user_preferences scoped to device (needed for ON CONFLICT upsert)
+ALTER TABLE user_preferences ADD CONSTRAINT IF NOT EXISTS user_prefs_device_keyword_ext_unique UNIQUE (device_id, pattern_keyword, extension);

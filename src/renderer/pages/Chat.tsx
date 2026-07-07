@@ -13,6 +13,7 @@ import { useChatContext } from '../context/ChatContext';
 import ApprovalModal from '../components/ApprovalModal';
 import ChatApprovalModal from '../components/ChatApprovalModal';
 import SearchResults from '../components/SearchResults';
+import { apiFetch } from '../lib/apiFetch';
 
 // ─── motion variants ──────────────────────────────────────────────────────────
 
@@ -932,7 +933,7 @@ function ChatHistoryPanel({ onLoad, onDelete, onNew, onSave, onClose, currentId,
   const fetchSessions = useCallback(async () => {
     setLoading(true);
     try {
-      const res  = await fetch('http://localhost:3001/api/sessions');
+      const res  = await apiFetch('/api/sessions');
       if (!res.ok) throw new Error(`Server error: ${res.status}`);
       const data = await res.json() as SessionSummary[];
       setSessions(Array.isArray(data) ? data : []);

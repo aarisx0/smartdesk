@@ -6,10 +6,8 @@
  * Learning engine — records user approval/override patterns and
  * promotes them to automatic rules after 3 confirmations.
  *
- * Rules:
- *  - After 3 confirmations for the same (keyword, extension) pair
- *    → is_learned_rule = true → future classifications skip watsonx
- *  - 2 overrides of a learned rule → demote back to suggestion
+ * All operations are scoped to a device_id so each installation
+ * maintains its own independent set of learned rules.
  */
 
 const { query } = require('../db/supabase');
@@ -20,15 +18,8 @@ const STOP_WORDS = new Set([
   'of', 'and', 'or', 'my', 'file', 'new', 'copy', 'final', 'draft',
 ]);
 
-/**
- * Extract a short keyword from a filename (stem, lowercased, stop-words removed).
- * e.g. "Q4_Sales_Report.xlsx" → "q4_sales_report"
- * @param {string} filename
- * @returns {string}
- */
 function extractKeyword(filename) {
   const stem = filename.replace(/\.[^.]+$/, '').toLowerCase();
-  // Keep alphanumeric + underscores, strip the rest
   const cleaned = stem.replace(/[^a-z0-9_]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
   return cleaned.split('_').filter((w) => w.length > 1 && !STOP_WORDS.has(w)).join('_') || cleaned;
 }
@@ -36,63 +27,55 @@ function extractKeyword(filename) {
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
- * Record a user approval: increment confirmation count, promote to learned rule at 3.
- *
- * @param {object} params
- * @param {string} params.filename
- * @param {string} params.extension
- * @param {string|null} params.aiFolder         Folder watsonx suggested
- * @param {string}      params.userFolder        Folder user confirmed
- */
-async function recordApproval({ filename, extension, aiFolder, userFolder }) {
-  const keyword = extractKeyword(filename);
-  try {
-    await query(
-      `INSERT INTO user_preferences
-         (pattern_keyword, extension, ai_suggested_folder, user_confirmed_folder, times_confirmed)
-       VALUES ($1, $2, $3, $4, 1)
-       ON CONFLICT (pattern_keyword, extension)
-       DO UPDATE SET
-         times_confirmed       = user_preferences.times_confirmed + 1,
-         user_confirmed_folder = EXCLUDED.user_confirmed_folder,
-         is_learned_rule       = (user_preferences.times_confirmed + 1) >= 3`,
-      [keyword, extension ?? null, aiFolder ?? null, userFolder]
-    );
-    console.log(`[learning] approval recorded: ${keyword} → ${userFolder}`);
-  } catch (err) {
-    console.error('[learning] recordApproval error:', err.message);
-  }
-}
-
-/**
- * Record a user override (moved file to a different folder than AI suggested).
- * Two overrides demote a learned rule back to a suggestion.
+ * Record a user approval scoped to a device.
  *
  * @param {object} params
  * @param {string} params.filename
  * @param {string} params.extension
  * @param {string|null} params.aiFolder
  * @param {string}      params.userFolder
+ * @param {string}      [params.deviceId='unknown']
  */
-async function recordOverride({ filename, extension, aiFolder, userFolder }) {
+async function recordApproval({ filename, extension, aiFolder, userFolder, deviceId = 'unknown' }) {
   const keyword = extractKeyword(filename);
   try {
-    // Check current state
+    await query(
+      `INSERT INTO user_preferences
+         (device_id, pattern_keyword, extension, ai_suggested_folder, user_confirmed_folder, times_confirmed)
+       VALUES ($1, $2, $3, $4, $5, 1)
+       ON CONFLICT (device_id, pattern_keyword, extension)
+       DO UPDATE SET
+         times_confirmed       = user_preferences.times_confirmed + 1,
+         user_confirmed_folder = EXCLUDED.user_confirmed_folder,
+         is_learned_rule       = (user_preferences.times_confirmed + 1) >= 3`,
+      [deviceId, keyword, extension ?? null, aiFolder ?? null, userFolder]
+    );
+    console.log(`[learning] approval recorded: ${keyword} → ${userFolder} (device: ${deviceId})`);
+  } catch (err) {
+    console.error('[learning] recordApproval error:', err.message);
+  }
+}
+
+/**
+ * Record a user override scoped to a device.
+ */
+async function recordOverride({ filename, extension, aiFolder, userFolder, deviceId = 'unknown' }) {
+  const keyword = extractKeyword(filename);
+  try {
     const { rows } = await query(
       `SELECT id, times_confirmed, is_learned_rule FROM user_preferences
-       WHERE pattern_keyword = $1 AND extension = $2 LIMIT 1`,
-      [keyword, extension ?? null]
+       WHERE device_id = $1 AND pattern_keyword = $2 AND extension = $3
+       LIMIT 1`,
+      [deviceId, keyword, extension ?? null]
     );
 
     if (rows.length === 0) {
-      // No existing rule — treat as a fresh approval for the overridden folder
-      await recordApproval({ filename, extension, aiFolder, userFolder });
+      await recordApproval({ filename, extension, aiFolder, userFolder, deviceId });
       return;
     }
 
     const rule = rows[0];
-    // Demote learned rule after 2 overrides (decrement by 2)
-    const newCount = Math.max(0, rule.times_confirmed - 2);
+    const newCount  = Math.max(0, rule.times_confirmed - 2);
     const isLearned = newCount >= 3;
 
     await query(
@@ -101,31 +84,27 @@ async function recordOverride({ filename, extension, aiFolder, userFolder }) {
        WHERE id = $4`,
       [newCount, isLearned, userFolder, rule.id]
     );
-    console.log(`[learning] override recorded: ${keyword} demoted to ${newCount} confirmations`);
+    console.log(`[learning] override recorded: ${keyword} demoted to ${newCount}`);
   } catch (err) {
     console.error('[learning] recordOverride error:', err.message);
   }
 }
 
 /**
- * Check if a learned rule exists for the given filename + extension.
- * Returns the destination folder if found, null otherwise.
- *
- * @param {string} filename
- * @param {string} extension
- * @returns {Promise<{folder: string, confidence: number}|null>}
+ * Check if a learned rule exists for this device.
  */
-async function checkLearnedRule(filename, extension) {
+async function checkLearnedRule(filename, extension, deviceId = 'unknown') {
   const keyword = extractKeyword(filename);
   try {
     const { rows } = await query(
       `SELECT user_confirmed_folder, times_confirmed FROM user_preferences
-       WHERE is_learned_rule = true
-         AND (pattern_keyword = $1 OR $1 ILIKE '%' || pattern_keyword || '%')
-         AND (extension = $2 OR extension IS NULL)
+       WHERE device_id = $1
+         AND is_learned_rule = true
+         AND (pattern_keyword = $2 OR $2 ILIKE '%' || pattern_keyword || '%')
+         AND (extension = $3 OR extension IS NULL)
        ORDER BY times_confirmed DESC
        LIMIT 1`,
-      [keyword, extension ?? null]
+      [deviceId, keyword, extension ?? null]
     );
     if (rows.length === 0) return null;
     return {
@@ -139,16 +118,17 @@ async function checkLearnedRule(filename, extension) {
 }
 
 /**
- * Return all learned rules for display in Settings.
- * @returns {Promise<object[]>}
+ * Return all rules for this device (for Settings page).
  */
-async function getAllRules() {
+async function getAllRules(deviceId = 'unknown') {
   try {
     const { rows } = await query(
       `SELECT id, pattern_keyword, extension, user_confirmed_folder,
               times_confirmed, is_learned_rule, created_at
        FROM user_preferences
-       ORDER BY is_learned_rule DESC, times_confirmed DESC`
+       WHERE device_id = $1
+       ORDER BY is_learned_rule DESC, times_confirmed DESC`,
+      [deviceId]
     );
     return rows;
   } catch (err) {
@@ -159,7 +139,6 @@ async function getAllRules() {
 
 /**
  * Delete a specific rule by id.
- * @param {string} id UUID
  */
 async function deleteRule(id) {
   try {
@@ -170,12 +149,12 @@ async function deleteRule(id) {
 }
 
 /**
- * Clear all learned rules.
+ * Clear all rules for this device.
  */
-async function clearAllRules() {
+async function clearAllRules(deviceId = 'unknown') {
   try {
-    await query(`DELETE FROM user_preferences`);
-    console.log('[learning] all rules cleared');
+    await query(`DELETE FROM user_preferences WHERE device_id = $1`, [deviceId]);
+    console.log('[learning] all rules cleared for device:', deviceId);
   } catch (err) {
     console.error('[learning] clearAllRules error:', err.message);
   }

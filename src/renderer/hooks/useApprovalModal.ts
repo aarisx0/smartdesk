@@ -1,5 +1,6 @@
 import { useState, useCallback, useMemo } from 'react';
 import type { PendingFile } from './useDashboard';
+import { apiFetch } from '../lib/apiFetch';
 
 // ─── types ────────────────────────────────────────────────────────────────────
 
@@ -120,7 +121,7 @@ export function useApprovalModal(files: PendingFile[], onDone: () => void) {
 
       // ── Call the REST approve endpoint ──────────────────────────────────────
       try {
-        const res = await fetch('http://localhost:3001/api/moves/approve', {
+        const res = await apiFetch('/api/moves/approve', {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
           body:    JSON.stringify({ fileId: id, approved: true }),
@@ -185,7 +186,7 @@ function sleep(ms: number) {
 
 async function fetchSessionStats(): Promise<SessionStatsSnapshot> {
   try {
-    const res = await fetch('http://localhost:3001/api/stats');
+    const res = await apiFetch('/api/stats');
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json() as Record<string, unknown>;
     return {
